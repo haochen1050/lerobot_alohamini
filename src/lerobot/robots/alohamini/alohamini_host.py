@@ -302,28 +302,6 @@ def main():
             }
             observation_done_t = time.perf_counter()
 
-            # Expire the lease before reading queued commands, including the same owner's.
-            watchdog_tripped = (
-                has_received_command
-                and time.monotonic() - last_cmd_time > host.watchdog_timeout_ms / 1000
-                and not watchdog_active
-            )
-            if watchdog_tripped:
-                logging.warning("Host command watchdog expired; stopping motion")
-                watchdog_active = True
-                watchdog_events += 1
-                target_source = "watchdog"
-                last_command_metadata = {}
-                hold_action = {
-                    key: float(value) for key, value in last_observation.items() if key.endswith(".pos")
-                }
-                last_sent_action = robot.send_action(
-                    {**hold_action, "x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
-                )
-                robot.stop_motion()
-                has_received_command = False
-                command_owner.release()
-
             try:
                 msg = host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)
                 data = dict(json.loads(msg))
@@ -346,7 +324,7 @@ def main():
                     validated_action[key] = numeric_value
                 if not validated_action:
                     raise ValueError("Received command contains no finite numeric action values.")
-                if not watchdog_tripped and command_owner.accept(
+                if command_owner.accept(
                     command_metadata, robot.get_safety_status()["host_session_id"]
                 ):
                     latest_action = validated_action
@@ -361,6 +339,29 @@ def main():
             except Exception as e:
                 logging.exception("Message fetching failed: %s", e)
             command_done_t = time.perf_counter()
+
+            # Valid available commands renew the lease before checking inactivity.
+            # Invalid, duplicate, old-epoch and foreign commands cannot renew it.
+            watchdog_tripped = (
+                has_received_command
+                and time.monotonic() - last_cmd_time > host.watchdog_timeout_ms / 1000
+                and not watchdog_active
+            )
+            if watchdog_tripped:
+                logging.warning("Host command watchdog expired; stopping motion")
+                watchdog_active = True
+                watchdog_events += 1
+                target_source = "watchdog"
+                last_command_metadata = {}
+                hold_action = {
+                    key: float(value) for key, value in last_observation.items() if key.endswith(".pos")
+                }
+                last_sent_action = robot.send_action(
+                    {**hold_action, "x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
+                )
+                robot.stop_motion()
+                has_received_command = False
+                command_owner.release()
 
             action_sent = False
             if command_received:

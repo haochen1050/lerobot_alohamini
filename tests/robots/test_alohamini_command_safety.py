@@ -63,6 +63,7 @@ def test_failed_image_decode_does_not_mark_cached_frame_fresh():
     client = object.__new__(AlohaMiniClient)
     client._response_includes_cameras = False
     client.logs = {}
+    client.latest_safety_status = {}
     client._response_requested_at = time.monotonic()
     client.last_frames = {"forward": "cached"}
     client.last_remote_state = {}
@@ -153,6 +154,53 @@ def test_command_owner_rejects_competing_clients_until_watchdog_release():
     assert owner.owner == "ros"
 
 
+@pytest.mark.parametrize("incoming", ["current", "wrong_epoch", "duplicate", "invalid"])
+def test_host_accepts_available_command_before_expiry_but_invalid_commands_do_not_renew(
+    monkeypatch, incoming
+):
+    from lerobot.robots.alohamini import alohamini_host
+
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(alohamini_host.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(alohamini_host.time, "perf_counter", lambda: clock.now)
+    monkeypatch.setattr(
+        alohamini_host.time, "sleep", lambda seconds: setattr(clock, "now", clock.now + seconds)
+    )
+    monkeypatch.setattr("sys.argv", ["alohamini_host"])
+    robot = Mock(cameras={}, logs={}, _feedback_currents_raw={})
+    robot.action_features = {"joint.pos": float}
+    robot.get_observation.return_value = {"joint.pos": 1.0}
+    robot.get_safety_status.side_effect = lambda: status()
+    robot.supervise_arm_motion.return_value = {}
+    identity = {"client_id": "pc", "sequence": 1, "control_epoch": 0, "host_session_id": "host-1"}
+    second = {**identity, "sequence": 2}
+    if incoming == "wrong_epoch":
+        second["control_epoch"] = 99
+    if incoming == "duplicate":
+        second["sequence"] = 1
+    target = float("nan") if incoming == "invalid" else 7.0
+    host = Mock(max_loop_freq_hz=50, connection_time_s=0.055, watchdog_timeout_ms=10)
+    host.zmq_cmd_socket.recv_string.side_effect = [
+        json.dumps({"joint.pos": 5.0, "_command": identity}),
+        json.dumps({"joint.pos": target, "_command": second}),
+        json.dumps({"joint.pos": 9.0, "_command": {
+            **identity, "sequence": 3, "control_epoch": 0 if incoming == "current" else 1,
+        }}),
+    ]
+    host.zmq_observation_socket.recv_multipart.return_value = [b"client", b"1:state"]
+    monkeypatch.setattr(alohamini_host, "AlohaMini", lambda config: robot)
+    monkeypatch.setattr(alohamini_host, "AlohaMiniHost", lambda config: host)
+    monkeypatch.setattr(alohamini_host, "build_robot_metadata", lambda robot: {})
+    alohamini_host.main()
+    replies = [json.loads(call.args[0][2])["_safety"]
+               for call in host.zmq_observation_socket.send_multipart.call_args_list]
+    assert replies[1]["watchdog_active"] == (incoming != "current")
+    assert replies[2]["watchdog_events"] == int(incoming != "current")
+    assert not replies[2]["watchdog_active"]
+    assert replies[2]["command"]["sequence"] == 3
+    assert robot.stop_motion.call_count == int(incoming != "current")
+
+
 def test_command_owner_rejects_replay_and_previous_host_session():
     owner = CommandOwner()
     command = {"client_id": "pc", "sequence": 2, "host_session_id": "host", "control_epoch": 0}
@@ -233,19 +281,60 @@ def client_stub():
     return client
 
 
-@pytest.mark.parametrize("failure", ["stale", "invalid", "blocked"])
+@pytest.mark.parametrize("failure", ["stale", "missing", "blocked"])
 def test_unsent_action_is_not_reported_as_sent(failure):
     client = client_stub()
     if failure == "stale":
         client._feedback_requested_at -= 1
-    elif failure == "invalid":
-        client._feedback_valid = False
+    elif failure == "missing":
+        client._feedback_requested_at = None
     else:
         client.zmq_cmd_socket.send_string.side_effect = zmq.Again()
     assert client.send_action({"joint.pos": 2.0}) == {}
     assert client.last_sent_command == {}
     if failure != "blocked":
         client.zmq_cmd_socket.send_string.assert_not_called()
+
+
+def test_short_feedback_gap_does_not_block_new_leader_targets(monkeypatch):
+    client = client_stub()
+    client._feedback_requested_at = 10.0
+    client._feedback_valid = False
+    monkeypatch.setattr(time, "monotonic", lambda: 10.4)
+    assert not client.observation_updated
+    assert client.send_action({"joint.pos": 2.0})
+    assert client.send_action({"joint.pos": 3.0})
+    assert [json.loads(call.args[0])["joint.pos"]
+            for call in client.zmq_cmd_socket.send_string.call_args_list] == [2.0, 3.0]
+
+
+def test_cached_reads_cannot_renew_control_feedback_deadline(monkeypatch):
+    client = client_stub()
+    client._feedback_requested_at = 10.0
+    client._last_safety_received_at = 10.9
+    monkeypatch.setattr(time, "monotonic", lambda: 11.1)
+    assert not client.control_feedback_valid
+    assert client.send_action({"joint.pos": 2.0}) == {}
+    client.zmq_cmd_socket.send_string.assert_not_called()
+
+
+@pytest.mark.parametrize("delay", [0.4, 2.0])
+def test_delayed_valid_reply_is_a_sample_but_cannot_extend_control_deadline(monkeypatch, delay):
+    client = client_stub()
+    client.logs = {}
+    client._response_requested_at = 10.0
+    client._response_includes_cameras = False
+    client._observation_sequence = 0
+    client.last_frames = {}
+    client.last_remote_state = {"joint.pos": 1.0}
+    client._poll_and_get_latest_message = lambda **kwargs: [b"reply"]
+    client._parse_observation_message = lambda parts: ({"_safety": status()}, {})
+    client._remote_state_from_obs = lambda *args: ({}, {"joint.pos": 2.0})
+    monkeypatch.setattr(time, "monotonic", lambda: 10.0 + delay)
+    assert client._get_data()[1] == {"joint.pos": 2.0}
+    assert client.control_feedback_valid == (delay < 1.0)
+    assert client.observation_updated
+    assert client.observation_sequence == 1
 
 
 def test_command_echoes_epoch_and_uses_nonblocking_transport():
@@ -269,16 +358,16 @@ def test_missing_nonfinite_or_wrong_model_feedback_is_rejected(observation):
         client_stub()._remote_state_from_obs(observation, {})
 
 
-def test_delayed_response_cannot_refresh_feedback():
+def test_unmatched_response_cannot_refresh_feedback():
     client = client_stub()
     client.logs = {}
     client.last_frames = {}
     client.last_remote_state = {"joint.pos": 1}
-    client._response_requested_at = time.monotonic() - 2
+    client._response_requested_at = None
     client._observation_sequence = 8
     client._poll_and_get_latest_message = lambda **_kwargs: [b"late"]
     client._parse_observation_message = Mock()
     assert client._get_data()[1] == {"joint.pos": 1}
     assert client.observation_sequence == 8
-    assert not client.feedback_fresh
+    assert not client.observation_updated
     client._parse_observation_message.assert_not_called()

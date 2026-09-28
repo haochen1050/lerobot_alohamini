@@ -458,7 +458,7 @@ class AlohaMiniClient(Robot):
             return self.last_frames, self.last_remote_state
 
         requested_at = self._response_requested_at
-        if requested_at is None or time.monotonic() - requested_at > 0.25:
+        if requested_at is None:
             return self.last_frames, self.last_remote_state
 
         # 3. Parse the observation message
@@ -651,7 +651,7 @@ class AlohaMiniClient(Robot):
         Returns:
             np.ndarray: the action sent to the motors, potentially clipped.
         """
-        if not self.command_permitted or not self.feedback_fresh:
+        if not self.command_permitted or not self.control_feedback_valid:
             return {}
         payload = dict(action)
         if not payload or any(
@@ -681,13 +681,19 @@ class AlohaMiniClient(Robot):
         return action_sent
 
     @property
-    def feedback_fresh(self) -> bool:
-        timeout = min(0.25, self.latest_safety_status.get("command_watchdog_timeout_s", 0.25))
-        return (
-            self._feedback_valid
-            and self._feedback_requested_at is not None
-            and time.monotonic() - self._feedback_requested_at < timeout
-        )
+    def control_feedback_valid(self) -> bool:
+        """Allow brief response gaps without renewing motion through sustained loss.
+
+        Age starts at the last valid request, not at a cached read or late receipt.
+        """
+        requested_at = self._feedback_requested_at
+        timeout = self.latest_safety_status.get("command_watchdog_timeout_s", 1.0)
+        return requested_at is not None and time.monotonic() - requested_at < timeout
+
+    @property
+    def observation_updated(self) -> bool:
+        """Whether the last observation read decoded a new valid response, not a cache hit."""
+        return self._feedback_valid
 
     @property
     def command_permitted(self) -> bool:

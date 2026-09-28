@@ -29,15 +29,19 @@ def stop_inference(engine):
 
 
 class EvaluationSafetyGuard:
-    """Pause autonomous motion on protection or loss of fresh Host feedback."""
+    """Separate control availability, active protection, and prediction invalidation."""
 
     def __init__(self):
         self._host_id = None
-        self._events = (0, 0)
+        self._joint_hold_events = 0
+
+    @property
+    def context(self):
+        return self._host_id, self._joint_hold_events
 
     def acknowledge(self, status):
         self._host_id = status["host_session_id"]
-        self._events = (status["joint_hold_events"], status["watchdog_events"])
+        self._joint_hold_events = status["joint_hold_events"]
 
     def reason(self, robot):
         status = getattr(robot, "latest_safety_status", {})
@@ -46,76 +50,25 @@ class EvaluationSafetyGuard:
             return "Host 未提供保护状态，请更新树莓派 Host"
         if not getattr(robot, "command_permitted", True):
             return "控制权由其他客户端持有"
-        if not getattr(robot, "feedback_fresh", True):
+        if not getattr(robot, "control_feedback_valid", True):
             return "Host 反馈中断或过期"
-        feedback_timeout = min(1.0, status.get("command_watchdog_timeout_s", 1.0))
+        feedback_timeout = status.get("command_watchdog_timeout_s", 1.0)
         if received_at is None or time.monotonic() - received_at > feedback_timeout:
             return "Host 反馈中断"
         if self._host_id is not None and self._host_id != status["host_session_id"]:
             return "Host 已重新启动"
+        self.acknowledge(status)
         if status["joint_holds"]:
             return "关节保护：" + ", ".join(status["joint_holds"])
-        if status["watchdog_active"]:
-            return "Host 命令超时保护"
-        events = (status["joint_hold_events"], status["watchdog_events"])
-        if self._host_id is not None and events != self._events:
-            return "上个反馈周期内发生过保护"
-        self.acknowledge(status)
         return None
 
-    def check_observation(self, robot, observation):
-        """Refresh an expired snapshot before deciding whether feedback is lost."""
-        if not robot.feedback_fresh:
+    def check_observation(self, robot, observation, *, refresh=False):
+        """Refresh after blocking inference or prolonged loss, not on a dataset age limit."""
+        if refresh or not getattr(robot, "control_feedback_valid", True):
             observation = robot.refresh_observation()
-        return observation, self.reason(robot)
-
-    def recover(self, robot, engine, interpolator, recorder, observation, reason):
-        engine.pause()
-        interpolator.reset()
-        # The PC command does not wait for a Host acknowledgement.
-        robot.send_action(hold_action(observation))
-        if recorder is not None:
-            recorder.write(
-                safety=safety_snapshot(robot), event={"type": "evaluation_paused", "reason": reason}
-            )
-        stop_inference(engine)
-        while True:
-            input(f"{reason}。请排除障碍并用遥操反向解除关节保持；按 Enter 重新检查并恢复，Ctrl+C 结束：")
-            # Discard pre-pause responses before accepting a recovery snapshot.
-            previous = robot.observation_sequence
-            observation = robot.refresh_observation()
-            deadline = time.monotonic() + 2.0
-            while robot.observation_sequence == previous and time.monotonic() < deadline:
-                observation = robot.get_observation()
-            status = safety_snapshot(robot)
-            if robot.observation_sequence == previous or status.get("version") != 1:
-                reason = "尚未收到新的保护状态"
-                continue
-            if not robot.feedback_fresh or not robot.command_permitted:
-                reason = "反馈仍不可用或控制权由其他客户端持有"
-                continue
-            if status["joint_holds"]:
-                reason = "关节保持尚未解除"
-                continue
-            # Explicit recovery acknowledges an idle watchdog with a fresh hold command.
-            robot.send_action(hold_action(observation))
-            command = dict(robot.last_sent_command)
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline:
-                observation = robot.get_observation()
-                status = safety_snapshot(robot)
-                if status.get("command") == command and not status.get("watchdog_active"):
-                    break
-            else:
-                reason = "Host 未确认恢复命令"
-                continue
-            if status["joint_holds"]:
-                reason = "关节保持尚未解除"
-                continue
-            self.acknowledge(status)
-            engine.reset()
-            engine.start()
-            engine.resume()
-            if recorder is not None:
-                recorder.write(safety=status, event={"type": "evaluation_resumed"})
-            return
+        reason = self.reason(robot)
+        if reason not in (None, "Host 反馈中断或过期", "Host 反馈中断") and not reason.startswith(
+            "关节保护："
+        ):
+            raise RuntimeError(f"{reason}；评估停止。")
+        return observation, reason

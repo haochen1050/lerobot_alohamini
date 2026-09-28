@@ -56,14 +56,14 @@ def test_valid_response_is_returned_even_when_replenishment_is_backpressured(cli
     assert not caplog.records
 
 
-def test_backpressure_without_feedback_still_prevents_commands(client):
+def test_backpressure_after_prolonged_feedback_loss_prevents_commands(client):
     client._feedback_valid = True
-    client._feedback_requested_at = time.monotonic()
+    client._feedback_requested_at = time.monotonic() - 2.0
     client.zmq_observation_socket.send.side_effect = zmq.Again()
 
     client.get_observation(include_cameras=False)
 
-    assert not client.feedback_fresh
+    assert not client.observation_updated
     assert client.send_action({"x.vel": 0.1}) == {}
     client.zmq_cmd_socket.send_string.assert_not_called()
     assert not client._request_times
