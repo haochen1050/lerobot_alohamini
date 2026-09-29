@@ -21,7 +21,7 @@ def test_refresh_discards_prefetched_tokens_without_waiting_for_each_reply():
     def receive():
         assert not client._observation_request_tokens
         assert not client._request_times
-        assert not client.feedback_fresh
+        assert not client.observation_updated
         return {"joint.pos": 3.0}
 
     client.get_observation = receive
@@ -29,8 +29,10 @@ def test_refresh_discards_prefetched_tokens_without_waiting_for_each_reply():
     client.zmq_cmd_socket.send_string.assert_not_called()
 
 
-@pytest.mark.parametrize("delay", [0.05, 0.3, 0.6])
-@pytest.mark.parametrize("fault", [None, "feedback_lost", "watchdog", "restart", "owner", "joint_event"])
+@pytest.mark.parametrize("delay", [0.05, 0.3, 0.6, 1.2])
+@pytest.mark.parametrize(
+    "fault", [None, "feedback_lost", "feedback_gap", "watchdog", "restart", "owner", "joint_event", "epoch_jump", "joint_hold", "initial_hold"]
+)
 def test_actual_evaluation_loop_rechecks_feedback_after_sync_inference(monkeypatch, tmp_path, delay, fault):
     clock = SimpleNamespace(now=10.0)
     monkeypatch.setattr(evaluate_bi.time, "monotonic", lambda: clock.now)
@@ -55,8 +57,14 @@ def test_actual_evaluation_loop_rechecks_feedback_after_sync_inference(monkeypat
     computed = []
     frames = []
     refreshed = []
+    missed_reads = []
+    held_reads = []
 
     def get_observation():
+        if computed and fault == "feedback_gap" and len(missed_reads) < 2:
+            missed_reads.append(clock.now)
+            client._feedback_valid = False
+            return client.last_remote_state
         if computed and fault == "feedback_lost":
             client._feedback_valid = False
             return client.last_remote_state
@@ -69,14 +77,26 @@ def test_actual_evaluation_loop_rechecks_feedback_after_sync_inference(monkeypat
         client._feedback_requested_at = clock.now
         client._last_safety_received_at = clock.now
         client._observation_request_tokens.append(b"prefetched")
+        if fault == "initial_hold":
+            client.latest_safety_status["joint_holds"] = {"elbow": 1.0} if not held_reads else {}
+            held_reads.append(clock.now)
         if computed:
             updates = {
-                "watchdog": {"watchdog_active": True, "watchdog_events": 1, "control_epoch": 1},
+                "watchdog": {
+                    "watchdog_active": True,
+                    "watchdog_events": len(computed),
+                    "control_epoch": len(computed),
+                },
                 "restart": {"host_session_id": "host-restarted"},
                 "owner": {"control_owner": "another-client"},
                 "joint_event": {"joint_hold_events": 1},
+                "epoch_jump": {"control_epoch": 3, "watchdog_events": 3},
             }
             client.latest_safety_status.update(updates.get(fault, {}))
+            if fault == "joint_hold":
+                client.latest_safety_status["joint_hold_events"] = 1
+                client.latest_safety_status["joint_holds"] = {"elbow": 1.0} if not held_reads else {}
+                held_reads.append(clock.now)
         return client.last_remote_state
 
     def refresh():
@@ -134,10 +154,11 @@ def test_actual_evaluation_loop_rechecks_feedback_after_sync_inference(monkeypat
             "--dataset.push_to_hub=false",
         ],
     )
-    monkeypatch.setattr("builtins.input", lambda _prompt: (_ for _ in ()).throw(KeyboardInterrupt()))
+    prompt = Mock(side_effect=AssertionError("Evaluation must not require Enter"))
+    monkeypatch.setattr("builtins.input", prompt)
 
-    if fault:
-        with pytest.raises(KeyboardInterrupt):
+    if fault in ("restart", "owner"):
+        with pytest.raises(RuntimeError, match="评估停止"):
             evaluate_bi.main()
     else:
         evaluate_bi.main()
@@ -146,22 +167,47 @@ def test_actual_evaluation_loop_rechecks_feedback_after_sync_inference(monkeypat
         for call in client.zmq_cmd_socket.send_string.call_args_list
         if json.loads(call.args[0]).get("joint.pos") == 7.0
     ]
-    if fault:
+    if fault in ("restart", "owner") or (fault == "feedback_lost" and delay >= 1.0):
         assert not policy_commands
         assert not frames
         engine.pause.assert_called()
     else:
-        assert len(policy_commands) >= 2
-        assert len(frames) == len(policy_commands)
+        assert len(policy_commands) >= 1
+        assert len(frames) <= len(policy_commands)
+        if fault in ("joint_event", "joint_hold"):
+            assert engine.reset.call_count == 2
+            assert engine.get_action.call_count == len(policy_commands) + 1
+        if fault in ("watchdog", "epoch_jump"):
+            assert engine.reset.call_count == 1
+            epochs = [row["_command"]["control_epoch"] for row in policy_commands]
+            assert epochs == (list(range(1, len(epochs) + 1)) if fault == "watchdog" else [3] * len(epochs))
+            assert engine.get_action.call_count == len(policy_commands)
         if delay > 0.25:
             assert len(refreshed) >= len(policy_commands)
+        if fault == "feedback_lost":
+            assert all(start + delay < 11.0 for start in computed[:len(policy_commands)])
+            assert not frames
+    prompt.assert_not_called()
+    if not frames:
+        dataset.save_episode.assert_not_called()
     client.disconnect.assert_called_once()
     dataset.finalize.assert_called_once()
 
 
+def test_recording_delay_limit_does_not_gate_evaluation(monkeypatch):
+    client = client_stub()
+    client.latest_safety_status = status()
+    client._feedback_requested_at = 10.0
+    client._last_safety_received_at = 10.4
+    monkeypatch.setattr(time, "monotonic", lambda: 10.4)
+    client.refresh_observation = Mock()
+    assert EvaluationSafetyGuard().check_observation(client, {}) == ({}, None)
+    client.refresh_observation.assert_not_called()
+
+
 def test_fresh_feedback_needs_no_extra_round_trip():
     robot = SimpleNamespace(
-        feedback_fresh=True,
+        control_feedback_valid=True,
         latest_safety_status=status(),
         _last_safety_received_at=time.monotonic(),
         refresh_observation=Mock(),

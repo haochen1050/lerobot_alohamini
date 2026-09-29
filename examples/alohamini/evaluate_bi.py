@@ -2,6 +2,7 @@
 
 import argparse
 import inspect
+import logging
 import math
 import time
 
@@ -276,54 +277,77 @@ def main():
             interpolator.reset()
             engine.resume()
             start = time.perf_counter()
-            cached_obs_processed = None
+            restart_pending = False
+            episode_frames = 0
 
             while (time.perf_counter() - start) < args.episode_time:
                 loop_start = time.perf_counter()
 
                 obs_raw = robot.get_observation()
+                previous_context = safety_guard.context
                 obs_raw, reason = safety_guard.check_observation(robot, obs_raw)
                 if reason:
-                    paused_at = time.perf_counter()
-                    safety_guard.recover(robot, engine, interpolator, None, obs_raw, reason)
-                    start += time.perf_counter() - paused_at
-                    cached_obs_processed = None
+                    if not restart_pending:
+                        logging.warning("%s；等待新反馈，暂不发送动作。", reason)
+                        engine.pause()
+                        interpolator.reset()
+                        restart_pending = True
+                    precise_sleep(control_interval)
                     continue
-                if cached_obs_processed is None or interpolator.needs_new_action():
-                    obs_processed = robot_observation_processor(obs_raw)
+                if restart_pending or (
+                    previous_context[0] is not None and safety_guard.context != previous_context
+                ):
+                    stop_inference(engine)
+                    engine.reset()
+                    interpolator.reset()
+                    engine.start()
+                    engine.resume()
+                    restart_pending = False
+                inference_context = safety_guard.context
+                obs_processed = robot_observation_processor(obs_raw)
+                if interpolator.needs_new_action():
                     engine.notify_observation(obs_processed)
-                    cached_obs_processed = obs_processed
-                else:
-                    obs_processed = cached_obs_processed
                 obs_frame = build_dataset_frame(dataset_features, obs_processed, prefix=OBS_STR)
 
+                inference_started = time.perf_counter()
                 if interpolator.needs_new_action():
                     action_tensor = engine.get_action(obs_frame)
                     if action_tensor is not None:
+                        if action_tensor.ndim != 1 or action_tensor.numel() != len(ordered_action_keys):
+                            raise ValueError("Policy action shape does not match the robot actuator schema")
                         interpolator.add(action_tensor.cpu())
 
-                obs_raw, reason = safety_guard.check_observation(robot, obs_raw)
-                if reason:
-                    paused_at = time.perf_counter()
-                    safety_guard.recover(robot, engine, interpolator, None, obs_raw, reason)
-                    start += time.perf_counter() - paused_at
-                    cached_obs_processed = None
+                obs_raw, reason = safety_guard.check_observation(
+                    robot, obs_raw,
+                    refresh=time.perf_counter() - inference_started >= control_interval,
+                )
+                if reason or safety_guard.context != inference_context:
+                    # Discard predictions across joint protection or prolonged feedback loss.
+                    engine.pause()
+                    interpolator.reset()
+                    restart_pending = True
+                    precise_sleep(control_interval)
                     continue
                 obs_processed = robot_observation_processor(obs_raw)
                 obs_frame = build_dataset_frame(dataset_features, obs_processed, prefix=OBS_STR)
                 interp_action = interpolator.get()
                 if interp_action is not None:
                     action_dict = {k: interp_action[i].item() for i, k in enumerate(ordered_action_keys)}
-                    if robot.send_action(robot_action_processor((action_dict, obs_raw))):
+                    sent = robot.send_action(robot_action_processor((action_dict, obs_raw)))
+                    if sent and robot.observation_updated:
                         action_frame = build_dataset_frame(dataset_features, action_dict, prefix=ACTION)
                         dataset.add_frame({**obs_frame, **action_frame, "task": args.task_description})
+                        episode_frames += 1
 
                 dt = time.perf_counter() - loop_start
                 if (sleep_t := control_interval - dt) > 0:
                     precise_sleep(sleep_t)
 
             engine.pause()
-            dataset.save_episode()
+            if episode_frames:
+                dataset.save_episode()
+            else:
+                logging.warning("No evaluation frames collected; skipping empty episode.")
             recorded += 1
             if recorded < args.num_episodes:
                 reset_environment(recorded + 1)
