@@ -4,9 +4,11 @@ python examples/debug/motors.py get_motors_states \
   --port /dev/ttyACM0
 ```
 #### Control the mobile base only
+One short pulse per key (W/S forward/back, A/D strafe, Q/E rotate, X exit), each followed by a verified stop.
+`--pulse-test` runs a single 0.3 s forward pulse and checks every wheel returns to zero.
 ```
 python examples/debug/wheels.py \
-   --port /dev/ttyACM0
+   --port /dev/ttyACM0 --robot-model alohamini2pro [--pulse-test]
 ```
 
 #### Control the lift axis only
