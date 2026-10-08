@@ -26,6 +26,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import threading
@@ -215,12 +216,35 @@ def cmd_calibrate_extrinsics(args) -> None:
     print("Sanity check against your tape measure (expected roughly x=10 cm, z=110 cm).")
     print(f"Saved {args.extrinsics}")
 
+    # The forward camera looks roughly along +x, so a large yaw means the tag is rotated by a multiple
+    # of 90 deg relative to --tag-yaw-deg (the printed tag has no obvious "top").
+    cam_yaw = math.degrees(math.atan2(T_base_cam[1, 2], T_base_cam[0, 2]))
+    if abs(cam_yaw) > 45:
+        suggested = (args.tag_yaw_deg - 90 * round(cam_yaw / 90) + 180) % 360 - 180
+        print(
+            f"WARNING: camera yaw {cam_yaw:+.0f} deg - the tag is probably rotated relative to "
+            f"--tag-yaw-deg {args.tag_yaw_deg:g}. Re-run with --tag-yaw-deg {suggested:g}, and use the same "
+            f"value for watch/teach while the tag stays in this orientation."
+        )
+
+
+def table_tag_yaw(args) -> float:
+    """--tag-yaw-deg, else the yaw used at extrinsic calibration (robot faced the table then), else -90."""
+    if args.tag_yaw_deg is not None:
+        return args.tag_yaw_deg
+    try:
+        yaw = float(json.loads(Path(args.extrinsics).read_text())["tag_pose_in_base"][3])
+        print(f"Tag yaw {yaw:g} deg (from {args.extrinsics}; override with --tag-yaw-deg)")
+        return yaw
+    except (OSError, KeyError, IndexError, ValueError):
+        return -90.0
+
 
 def make_estimator(args, cam: LatestFrame | None, target: TableTarget) -> AprilTagTableEstimator:
     placement = TagPlacement(
         x_m=args.tag_edge_offset,
         y_m=args.tag_lateral,
-        yaw_deg=args.tag_yaw_deg,
+        yaw_deg=table_tag_yaw(args),
         size_m=args.tag_size,
         tag_id=args.tag_id,
     )
@@ -338,10 +362,15 @@ def parse_args():
         sp.add_argument(
             "--tag-id", type=int, default=None, help="Only use this tag ID (default: the one tag seen)"
         )
-        sp.add_argument("--tag-yaw-deg", type=float, default=-90.0)
 
     def table_args(sp):
         tag_args(sp)
+        sp.add_argument(
+            "--tag-yaw-deg",
+            type=float,
+            default=None,
+            help="Tag yaw in the table frame (default: the value used for calibrate-extrinsics)",
+        )
         sp.add_argument(
             "--tag-edge-offset", type=float, required=True, help="Tag centre distance from the front edge (m)"
         )
@@ -375,6 +404,12 @@ def parse_args():
     sp.add_argument("--tag-x", type=float, required=True, help="Tag centre forward of the base centre (m)")
     sp.add_argument("--tag-y", type=float, default=0.0, help="Tag centre left of the base centre (m)")
     sp.add_argument("--tag-z", type=float, default=0.0, help="Tag height above the floor (m)")
+    sp.add_argument(
+        "--tag-yaw-deg",
+        type=float,
+        default=-90.0,
+        help="-90: printed top points away from the robot; 0: printed top points to the robot's left",
+    )
     sp.add_argument("--frames", type=int, default=30)
     sp.set_defaults(func=cmd_calibrate_extrinsics)
 
