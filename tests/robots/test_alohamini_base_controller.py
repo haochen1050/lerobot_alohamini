@@ -208,7 +208,11 @@ def test_non_finite_command_stops_base():
     assert bus.goal == dict.fromkeys(WHEEL_NAMES, 0)
 
 
-def test_open_wheel_bus_rejects_wrong_device(monkeypatch):
+@pytest.mark.parametrize(
+    ("answering", "power_hint"),
+    [({LEFT: 2825, BACK: 2825}, False), ({}, True)],
+)
+def test_open_wheel_bus_rejects_wrong_device(monkeypatch, answering, power_hint):
     from lerobot.motors.feetech import feetech
     from lerobot.robots.alohamini.base import WheelBusMismatchError, open_wheel_bus
 
@@ -222,13 +226,14 @@ def test_open_wheel_bus_rejects_wrong_device(monkeypatch):
             pass
 
         def ping(self, name, num_retry=0):
-            return None if name == RIGHT else 2825
+            return answering.get(name)
 
         def disconnect(self, disable_torque):
             disconnected.append(disable_torque)
 
     monkeypatch.setattr(feetech, "FeetechMotorsBus", FakeFeetech)
     monkeypatch.setattr("lerobot.motors.feetech.FeetechMotorsBus", FakeFeetech)
-    with pytest.raises(WheelBusMismatchError, match="not the wheel bus"):
+    with pytest.raises(WheelBusMismatchError, match="not the wheel bus") as excinfo:
         open_wheel_bus("/dev/null", "sts3250")
+    assert ("base motor power" in str(excinfo.value)) == power_hint
     assert disconnected == [False]

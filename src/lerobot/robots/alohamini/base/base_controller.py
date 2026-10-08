@@ -270,9 +270,14 @@ def open_wheel_bus(
         found = {name: bus.ping(name, num_retry=2) for name in motors}
         bad = {name: model for name, model in found.items() if model != expected}
         if bad:
+            hint = (
+                " No wheel answered: check that base motor power is switched on."
+                if all(model is None for model in found.values())
+                else ""
+            )
             raise WheelBusMismatchError(
                 f"{port} is not the wheel bus: expected model {expected} ({motor_model}) on IDs "
-                f"{list(wheel_ids)}, got {found}"
+                f"{list(wheel_ids)}, got {found}.{hint}"
             )
 
         for name in motors:
