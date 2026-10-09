@@ -263,18 +263,23 @@ def tag_placement_args(args) -> dict:
     }
 
 
+def target_placement_mismatch(args) -> str | None:
+    """Description of how the current tag options differ from those used to teach the target, if they do."""
+    path = Path(args.target)
+    taught_with = json.loads(path.read_text()).get("tag_placement") if path.exists() else None
+    now = tag_placement_args(args)
+    if taught_with is not None and taught_with != now:
+        return f"target was taught with tag placement {taught_with}, now using {now}"
+    return None
+
+
 def load_target(args) -> TableTarget:
     path = Path(args.target)
     if path.exists():
         target = TableTarget.load(path)
         print(f"Target from {path}: {target}")
-        taught_with = json.loads(path.read_text()).get("tag_placement")
-        now = tag_placement_args(args)
-        if taught_with is not None and taught_with != now:
-            print(
-                f"WARNING: target was taught with tag placement {taught_with}, now using {now}. "
-                "Errors will be offset; use the same tag options or re-teach."
-            )
+        if (mismatch := target_placement_mismatch(args)) is not None:
+            print(f"WARNING: {mismatch}. Errors will be offset; use the same tag options or re-teach.")
         return target
     print(f"No taught target at {path}; errors are relative to TableTarget() defaults")
     return TableTarget(reference_x_m=args.reference_x)
@@ -361,43 +366,51 @@ def cmd_snapshot(args) -> None:
 # ------------------------------------------------------------------ CLI
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def add_camera_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--camera", default=DEFAULTS["camera"])
     p.add_argument("--intrinsics", default=str(DEFAULTS["intrinsics"]))
     p.add_argument("--extrinsics", default=str(DEFAULTS["extrinsics"]))
+
+
+def board_args(sp) -> None:
+    sp.add_argument("--squares-x", type=int, default=9)
+    sp.add_argument("--squares-y", type=int, default=12)
+    sp.add_argument("--square-m", type=float, default=0.030)
+    sp.add_argument("--marker-m", type=float, default=0.0225)
+
+
+def tag_args(sp) -> None:
+    sp.add_argument("--tag-size", type=float, default=0.10, help="Black square edge (m)")
+    sp.add_argument(
+        "--tag-id", type=int, default=None, help="Only use this tag ID (default: the one tag seen)"
+    )
+
+
+def table_args(sp) -> None:
+    """Tag placement on the table and target options, shared by watch/teach and the alignment script."""
+    tag_args(sp)
+    sp.add_argument(
+        "--tag-yaw-deg",
+        type=float,
+        default=None,
+        help="Tag yaw in the table frame (default: the value used for calibrate-extrinsics)",
+    )
+    sp.add_argument(
+        "--tag-edge-offset", type=float, required=True, help="Tag centre distance from the front edge (m)"
+    )
+    sp.add_argument(
+        "--tag-lateral", type=float, default=0.0, help="Tag centre left of the work-region centre (m)"
+    )
+    sp.add_argument(
+        "--reference-x", type=float, default=0.0, help="Robot reference point, fwd of base centre"
+    )
+    sp.add_argument("--target", default=str(DEFAULTS["target"]))
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_camera_args(p)
     sub = p.add_subparsers(dest="cmd", required=True)
-
-    def board_args(sp):
-        sp.add_argument("--squares-x", type=int, default=9)
-        sp.add_argument("--squares-y", type=int, default=12)
-        sp.add_argument("--square-m", type=float, default=0.030)
-        sp.add_argument("--marker-m", type=float, default=0.0225)
-
-    def tag_args(sp):
-        sp.add_argument("--tag-size", type=float, default=0.10, help="Black square edge (m)")
-        sp.add_argument(
-            "--tag-id", type=int, default=None, help="Only use this tag ID (default: the one tag seen)"
-        )
-
-    def table_args(sp):
-        tag_args(sp)
-        sp.add_argument(
-            "--tag-yaw-deg",
-            type=float,
-            default=None,
-            help="Tag yaw in the table frame (default: the value used for calibrate-extrinsics)",
-        )
-        sp.add_argument(
-            "--tag-edge-offset", type=float, required=True, help="Tag centre distance from the front edge (m)"
-        )
-        sp.add_argument(
-            "--tag-lateral", type=float, default=0.0, help="Tag centre left of the work-region centre (m)"
-        )
-        sp.add_argument(
-            "--reference-x", type=float, default=0.0, help="Robot reference point, fwd of base centre"
-        )
-        sp.add_argument("--target", default=str(DEFAULTS["target"]))
 
     sp = sub.add_parser("snapshot", help="Save one frame with detected AprilTags drawn (headless preview)")
     sp.add_argument("--out", default=str(OUT / "snapshot.png"))
