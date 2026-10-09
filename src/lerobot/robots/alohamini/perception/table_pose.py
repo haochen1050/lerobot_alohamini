@@ -38,7 +38,7 @@ on the matching axis.
 import abc
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 import numpy as np
@@ -82,13 +82,15 @@ class TableTarget:
             measured.distance_m, measured.lateral_m, measured.heading_deg, reference_x_m, reference_y_m
         )
 
-    def save(self, path: str | Path) -> None:
+    def save(self, path: str | Path, **metadata) -> None:
+        """Extra ``metadata`` (e.g. the tag placement used while teaching) is stored alongside."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps(asdict(self), indent=2))
+        Path(path).write_text(json.dumps({**asdict(self), **metadata}, indent=2))
 
     @classmethod
     def load(cls, path: str | Path) -> "TableTarget":
-        return cls(**json.loads(Path(path).read_text()))
+        data = json.loads(Path(path).read_text())
+        return cls(**{f.name: data[f.name] for f in fields(cls) if f.name in data})
 
 
 @dataclass(frozen=True)

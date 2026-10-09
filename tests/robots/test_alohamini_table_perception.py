@@ -161,6 +161,25 @@ def test_estimator_rejects_stale_missing_wrong_and_mismatched_frames():
     assert "does not match calibration" in est.estimate(cv2.resize(image, (320, 240)), 10.0).reason
 
 
+@pytest.mark.parametrize("rotation_deg", [90, 180, -90])
+def test_estimator_rejects_tag_rotated_relative_to_configured_yaw(rotation_deg):
+    placement = TagPlacement(x_m=0.12, tag_id=3)
+    T_base_table = pose_xyz_yaw(0.8, 0, 0.75, -6)
+    # The physical tag is turned relative to what `placement` says.
+    image = render_tag(T_base_table @ placement.T_table_tag() @ pose_xyz_yaw(0, 0, 0, rotation_deg))
+    est = AprilTagTableEstimator(INTRINSICS, T_BASE_CAM, placement, TableTarget(), clock=lambda: 0.0)
+    err = est.estimate(image, 0.0)
+    assert not err.valid
+    assert "tag probably rotated" in err.reason
+    assert est.last_T_base_table is None
+
+
+def test_target_load_ignores_metadata(tmp_path):
+    target = TableTarget(0.25, -0.006, -6.0)
+    target.save(tmp_path / "t.json", tag_placement={"edge_offset_m": 0.15})
+    assert TableTarget.load(tmp_path / "t.json") == target
+
+
 def test_estimator_without_frame_source_is_invalid():
     est = AprilTagTableEstimator(INTRINSICS, T_BASE_CAM, TagPlacement(x_m=0.1), TableTarget())
     assert not est.get_table_pose_error().valid

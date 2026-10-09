@@ -121,6 +121,7 @@ class AprilTagTableEstimator(TablePoseEstimator):
         max_age_s: float = 0.3,
         max_reprojection_px: float = 2.0,
         max_tilt_deg: float = 15.0,
+        max_heading_deg: float = 45.0,
         clock: Callable[[], float] = time.monotonic,
     ):
         self.detector = AprilTagDetector(intrinsics, placement.size_m)
@@ -132,6 +133,7 @@ class AprilTagTableEstimator(TablePoseEstimator):
         self.max_age_s = max_age_s
         self.max_reprojection_px = max_reprojection_px
         self.min_up_cos = math.cos(math.radians(max_tilt_deg))
+        self.max_heading_deg = max_heading_deg
         self.clock = clock
         self._T_tag_table = invert(placement.T_table_tag())
         self._up_in_cam = T_base_cam[:3, :3].T @ np.array([0.0, 0.0, 1.0])
@@ -174,6 +176,17 @@ class AprilTagTableEstimator(TablePoseEstimator):
             tilt = math.degrees(math.acos(max(-1.0, min(1.0, T_base_tag[2, 2]))))
             return TablePoseError.invalid(capture_time_s, f"tag tilted {tilt:.0f} deg from horizontal")
 
+        T_base_table = T_base_tag @ self._T_tag_table
+        heading = math.degrees(math.atan2(T_base_table[1, 0], T_base_table[0, 0]))
+        if abs(heading) > self.max_heading_deg:
+            # Alignment starts roughly facing the table, so this almost always means the physical tag is
+            # rotated (by ~90/180 deg) relative to TagPlacement.yaw_deg. Acting on it would flip signs.
+            return TablePoseError.invalid(
+                capture_time_s,
+                f"table heading {heading:+.0f} deg exceeds +-{self.max_heading_deg:g}; tag probably rotated "
+                f"~{90 * round(heading / 90):+d} deg relative to its configured yaw",
+            )
+
         self.last_T_base_tag = T_base_tag
-        self.last_T_base_table = T_base_tag @ self._T_tag_table
-        return table_pose_error(self.last_T_base_table, self.target, capture_time_s)
+        self.last_T_base_table = T_base_table
+        return table_pose_error(T_base_table, self.target, capture_time_s)

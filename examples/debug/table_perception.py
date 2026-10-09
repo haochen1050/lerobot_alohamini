@@ -253,11 +253,28 @@ def make_estimator(args, cam: LatestFrame | None, target: TableTarget) -> AprilT
     )
 
 
+def tag_placement_args(args) -> dict:
+    return {
+        "edge_offset_m": args.tag_edge_offset,
+        "lateral_m": args.tag_lateral,
+        "yaw_deg": table_tag_yaw(args),
+        "size_m": args.tag_size,
+        "tag_id": args.tag_id,
+    }
+
+
 def load_target(args) -> TableTarget:
     path = Path(args.target)
     if path.exists():
         target = TableTarget.load(path)
         print(f"Target from {path}: {target}")
+        taught_with = json.loads(path.read_text()).get("tag_placement")
+        now = tag_placement_args(args)
+        if taught_with is not None and taught_with != now:
+            print(
+                f"WARNING: target was taught with tag placement {taught_with}, now using {now}. "
+                "Errors will be offset; use the same tag options or re-teach."
+            )
         return target
     print(f"No taught target at {path}; errors are relative to TableTarget() defaults")
     return TableTarget(reference_x_m=args.reference_x)
@@ -316,7 +333,7 @@ def cmd_teach(args) -> None:
     arr = np.array([[s.distance_m, s.lateral_m, s.heading_deg] for s in samples])
     mean, std = arr.mean(axis=0), arr.std(axis=0)
     target = TableTarget.taught(TableMeasurement(*mean), reference_x_m=args.reference_x)
-    target.save(args.target)
+    target.save(args.target, tag_placement=tag_placement_args(args))
     print(
         f"Taught from {len(samples)} frames: dist {mean[0] * 100:.1f} cm (+-{std[0] * 100:.2f}), "
         f"lat {mean[1] * 100:+.1f} cm (+-{std[1] * 100:.2f}), head {mean[2]:+.2f} deg (+-{std[2]:.2f})"
