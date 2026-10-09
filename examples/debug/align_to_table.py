@@ -65,6 +65,7 @@ def parse_args():
     )
     p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
     p.add_argument("--log-dir", default=str(OUT / "logs"))
+    p.add_argument("--timeout-s", type=float, default=AlignConfig.timeout_s, help="Overall alignment timeout")
     return p.parse_args()
 
 
@@ -75,7 +76,7 @@ def main() -> int:
     signal.signal(signal.SIGHUP, _raise_interrupt)
 
     axes = tuple(a.strip() for a in args.axes.split(",") if a.strip())
-    config = AlignConfig(axes=axes)
+    config = AlignConfig(axes=axes, timeout_s=args.timeout_s)
 
     if not Path(args.target).exists():
         raise SystemExit(f"No taught target at {args.target}; run table_perception.py teach first")
