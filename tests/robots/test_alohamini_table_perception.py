@@ -70,9 +70,13 @@ def tag_texture(tag_id=3, size_px=400):
     ) / size_px
 
 
-def render_tag(T_base_tag: np.ndarray, size_m=0.10, tag_id=3) -> np.ndarray:
+# The real forward camera (calibrated on the robot: 109.4 cm high, ~10 cm forward, pitched 44.9 deg down).
+T_BASE_CAM_REAL = camera_on_mast(height=1.094, forward=0.097, pitch_down_deg=44.9)
+
+
+def render_tag(T_base_tag: np.ndarray, size_m=0.10, tag_id=3, T_base_cam=T_BASE_CAM) -> np.ndarray:
     texture, scale = tag_texture(tag_id)
-    T_cam_tag = invert(T_BASE_CAM) @ T_base_tag
+    T_cam_tag = invert(T_base_cam) @ T_base_tag
     return render_plane(texture, (size_m * scale, size_m * scale), T_cam_tag)
 
 
@@ -178,6 +182,64 @@ def test_target_load_ignores_metadata(tmp_path):
     target = TableTarget(0.25, -0.006, -6.0)
     target.save(tmp_path / "t.json", tag_placement={"edge_offset_m": 0.15})
     assert TableTarget.load(tmp_path / "t.json") == target
+
+
+@pytest.mark.parametrize(
+    ("x", "y", "yaw_deg"),
+    [(0.32, 0.0, 0.0), (0.38, 0.06, 8.0), (0.30, -0.08, -10.0)],
+)
+def test_vertical_tag_on_table_edge(x, y, yaw_deg):
+    placement = TagPlacement(x_m=0.0, yaw_deg=0.0, tag_id=3, mount="vertical", z_m=-0.06)
+    target = TableTarget(distance_m=0.30)
+    T_base_table = pose_xyz_yaw(x, y, 0.75, yaw_deg)
+    T_base_tag = T_base_table @ placement.T_table_tag()
+    # Hung on the edge: face points back at the robot, printed top up, centre 6 cm below the top.
+    assert T_base_tag[:3, 2] @ T_base_table[:3, 0] == pytest.approx(-1)
+    assert T_base_tag[:3, 1] == pytest.approx([0, 0, 1])
+    assert T_base_tag[2, 3] == pytest.approx(0.69)
+
+    est = AprilTagTableEstimator(INTRINSICS, T_BASE_CAM_REAL, placement, target, clock=lambda: 0.0)
+    measured = est.estimate(render_tag(T_base_tag, T_base_cam=T_BASE_CAM_REAL), 0.0)
+    expected = table_pose_error(T_base_table, target, 0.0)
+
+    assert measured.valid, measured.reason
+    assert measured.distance_error_m == pytest.approx(expected.distance_error_m, abs=0.01)
+    assert measured.lateral_error_m == pytest.approx(expected.lateral_error_m, abs=0.015)
+    assert measured.heading_error_deg == pytest.approx(expected.heading_error_deg, abs=1.0)
+
+
+def test_mount_mismatch_is_rejected():
+    vertical = TagPlacement(x_m=0.0, yaw_deg=0.0, tag_id=3, mount="vertical", z_m=-0.06)
+    flat = TagPlacement(x_m=0.12, tag_id=3)
+    T_base_table = pose_xyz_yaw(0.33, 0, 0.75, 0)
+
+    # A hanging tag read with the flat model, and a flat tag read with the vertical model.
+    for physical, configured in ((vertical, flat), (flat, vertical)):
+        image = render_tag(T_base_table @ physical.T_table_tag(), T_base_cam=T_BASE_CAM_REAL)
+        est = AprilTagTableEstimator(
+            INTRINSICS, T_BASE_CAM_REAL, configured, TableTarget(), clock=lambda: 0.0
+        )
+        err = est.estimate(image, 0.0)
+        # Rejected either by the orientation check or because the forced PnP solution fits badly.
+        assert not err.valid
+        assert ("tilted" in err.reason and "--tag-mount" in err.reason) or "reprojection" in err.reason
+
+
+@pytest.mark.parametrize("rotation_deg", [90, 180])
+def test_vertical_tag_rotated_in_its_plane_is_rejected(rotation_deg):
+    placement = TagPlacement(x_m=0.0, yaw_deg=0.0, tag_id=3, mount="vertical", z_m=-0.06)
+    T_base_table = pose_xyz_yaw(0.33, 0, 0.75, 0)
+    image = render_tag(
+        T_base_table @ placement.T_table_tag() @ pose_xyz_yaw(0, 0, 0, rotation_deg),
+        T_base_cam=T_BASE_CAM_REAL,
+    )
+    est = AprilTagTableEstimator(INTRINSICS, T_BASE_CAM_REAL, placement, TableTarget(), clock=lambda: 0.0)
+    assert not est.estimate(image, 0.0).valid
+
+
+def test_unknown_mount_rejected():
+    with pytest.raises(ValueError):
+        TagPlacement(x_m=0.0, mount="ceiling")
 
 
 def test_estimator_without_frame_source_is_invalid():

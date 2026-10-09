@@ -38,22 +38,48 @@ from .table_pose import TablePoseError, TablePoseEstimator, TableTarget, table_p
 FrameSource = Callable[[], tuple[np.ndarray, float] | None]
 
 
+TAG_MOUNTS = ("flat", "vertical")
+
+# Reference orientation of each mount in the table frame (columns: tag x, y, z axes), before yaw_deg.
+_MOUNT_ROTATION = {
+    # Lying on the tabletop, face up; tag x into the table, printed top (tag y) to the robot's left.
+    "flat": np.eye(3),
+    # Hanging on the front edge, face towards the robot; printed top up, tag x to the robot's right.
+    "vertical": np.array([[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+}
+
+
 @dataclass(frozen=True)
 class TagPlacement:
     """Where the tag sits in the table frame (see table_pose.py)."""
 
-    # Distance of the tag centre from the front edge, into the table.
+    # Tag centre from the front edge, into the table (0 for a tag hung on the edge itself).
     x_m: float
     # Tag centre along the edge relative to the work-region centre (+ = left as seen by the robot).
     y_m: float = 0.0
-    # -90: printed top of the tag points into the table (away from the robot), edges parallel to the edge.
+    # Rotation of the printed tag about its own face normal, from the mount's reference orientation.
+    # Flat: -90 = printed top points into the table. Vertical: 0 = printed top points up.
     yaw_deg: float = -90.0
     size_m: float = 0.10
     # None accepts exactly one visible tag.
     tag_id: int | None = None
+    mount: str = "flat"
+    # Tag centre height relative to the tabletop (negative = below the top surface). Vertical mount only.
+    z_m: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.mount not in TAG_MOUNTS:
+            raise ValueError(f"mount must be one of {TAG_MOUNTS}, got {self.mount!r}")
 
     def T_table_tag(self) -> np.ndarray:
-        return pose_xyz_yaw(self.x_m, self.y_m, 0.0, self.yaw_deg)
+        z = self.z_m if self.mount == "vertical" else 0.0
+        T = pose_xyz_yaw(self.x_m, self.y_m, z, 0.0)
+        T[:3, :3] = _MOUNT_ROTATION[self.mount] @ pose_xyz_yaw(0, 0, 0, self.yaw_deg)[:3, :3]
+        return T
+
+    def up_in_tag(self) -> np.ndarray:
+        """World up (table z) expressed in the tag frame."""
+        return self.T_table_tag()[2, :3]
 
 
 @dataclass(frozen=True)
@@ -87,11 +113,19 @@ class AprilTagDetector:
             return []
         return [(int(i), c.reshape(4, 2)) for i, c in zip(ids.ravel(), corners, strict=True)]
 
-    def solve(self, tag_id: int, corners: np.ndarray, up_in_cam: np.ndarray | None = None) -> TagObservation:
+    def solve(
+        self,
+        tag_id: int,
+        corners: np.ndarray,
+        up_in_cam: np.ndarray | None = None,
+        up_in_tag: np.ndarray = np.array([0.0, 0.0, 1.0]),
+    ) -> TagObservation:
         """Tag pose in the camera frame.
 
         A planar square has two near-equivalent PnP solutions. With ``up_in_cam`` (the world up direction in
-        camera coordinates) the one whose normal is closest to up is chosen; otherwise the lowest reprojection.
+        camera coordinates) the one that best maps ``up_in_tag`` (the tag-frame direction that should point
+        up: the face normal for a flat tag, the printed top for a vertical one) onto up is chosen; otherwise
+        the lowest reprojection error.
         """
         _, rvecs, tvecs, errors = cv2.solvePnPGeneric(
             self._object_points,
@@ -105,7 +139,7 @@ class AprilTagDetector:
             for r, t, e in zip(rvecs, tvecs, errors, strict=True)
         ]
         if up_in_cam is not None:
-            return max(candidates, key=lambda o: float(o.T_cam_tag[:3, 2] @ up_in_cam))
+            return max(candidates, key=lambda o: float((o.T_cam_tag[:3, :3] @ up_in_tag) @ up_in_cam))
         return min(candidates, key=lambda o: o.reprojection_px)
 
 
@@ -137,6 +171,7 @@ class AprilTagTableEstimator(TablePoseEstimator):
         self.clock = clock
         self._T_tag_table = invert(placement.T_table_tag())
         self._up_in_cam = T_base_cam[:3, :3].T @ np.array([0.0, 0.0, 1.0])
+        self._up_in_tag = placement.up_in_tag()
         # Last accepted tag / table poses in the base frame, for logging and target teaching.
         self.last_T_base_tag: np.ndarray | None = None
         self.last_T_base_table: np.ndarray | None = None
@@ -165,18 +200,23 @@ class AprilTagTableEstimator(TablePoseEstimator):
             expected = "one tag" if wanted is None else f"tag {wanted}"
             return TablePoseError.invalid(capture_time_s, f"expected {expected}, saw {seen}")
 
-        obs = self.detector.solve(*matches[0], up_in_cam=self._up_in_cam)
+        obs = self.detector.solve(*matches[0], up_in_cam=self._up_in_cam, up_in_tag=self._up_in_tag)
         if obs.reprojection_px > self.max_reprojection_px:
             return TablePoseError.invalid(
                 capture_time_s, f"reprojection {obs.reprojection_px:.2f}px too high"
             )
 
         T_base_tag = self.T_base_cam @ obs.T_cam_tag
-        if T_base_tag[2, 2] < self.min_up_cos:
-            tilt = math.degrees(math.acos(max(-1.0, min(1.0, T_base_tag[2, 2]))))
-            return TablePoseError.invalid(capture_time_s, f"tag tilted {tilt:.0f} deg from horizontal")
-
         T_base_table = T_base_tag @ self._T_tag_table
+        # The table's up axis, as implied by the tag and its configured mount, must point up.
+        if T_base_table[2, 2] < self.min_up_cos:
+            tilt = math.degrees(math.acos(max(-1.0, min(1.0, T_base_table[2, 2]))))
+            return TablePoseError.invalid(
+                capture_time_s,
+                f"tag tilted {tilt:.0f} deg from its expected '{self.placement.mount}' orientation "
+                "(check --tag-mount / --tag-yaw-deg)",
+            )
+
         heading = math.degrees(math.atan2(T_base_table[1, 0], T_base_table[0, 0]))
         if abs(heading) > self.max_heading_deg:
             # Alignment starts roughly facing the table, so this almost always means the physical tag is

@@ -38,6 +38,7 @@ import cv2
 import numpy as np
 
 from lerobot.robots.alohamini.perception import (
+    TAG_MOUNTS,
     AprilTagDetector,
     AprilTagTableEstimator,
     CameraIntrinsics,
@@ -230,15 +231,23 @@ def cmd_calibrate_extrinsics(args) -> None:
 
 
 def table_tag_yaw(args) -> float:
-    """--tag-yaw-deg, else the yaw used at extrinsic calibration (robot faced the table then), else -90."""
+    """--tag-yaw-deg; else for a vertical tag 0 (printed top up); else for a flat tag the yaw used at extrinsic
+    calibration (the robot faced the table then), falling back to -90."""
     if args.tag_yaw_deg is not None:
         return args.tag_yaw_deg
-    try:
-        yaw = float(json.loads(Path(args.extrinsics).read_text())["tag_pose_in_base"][3])
-        print(f"Tag yaw {yaw:g} deg (from {args.extrinsics}; override with --tag-yaw-deg)")
-        return yaw
-    except (OSError, KeyError, IndexError, ValueError):
-        return -90.0
+    if getattr(args, "_resolved_tag_yaw", None) is not None:
+        return args._resolved_tag_yaw
+    if args.tag_mount == "vertical":
+        yaw, source = 0.0, "vertical mount default: printed top up"
+    else:
+        try:
+            yaw = float(json.loads(Path(args.extrinsics).read_text())["tag_pose_in_base"][3])
+            source = f"from {args.extrinsics}"
+        except (OSError, KeyError, IndexError, ValueError):
+            yaw, source = -90.0, "default"
+    print(f"Tag yaw {yaw:g} deg ({source}; override with --tag-yaw-deg)")
+    args._resolved_tag_yaw = yaw
+    return yaw
 
 
 def make_estimator(args, cam: LatestFrame | None, target: TableTarget) -> AprilTagTableEstimator:
@@ -248,6 +257,8 @@ def make_estimator(args, cam: LatestFrame | None, target: TableTarget) -> AprilT
         yaw_deg=table_tag_yaw(args),
         size_m=args.tag_size,
         tag_id=args.tag_id,
+        mount=args.tag_mount,
+        z_m=args.tag_height,
     )
     return AprilTagTableEstimator(
         CameraIntrinsics.load(args.intrinsics), load_transform(args.extrinsics), placement, target, cam
@@ -261,6 +272,8 @@ def tag_placement_args(args) -> dict:
         "yaw_deg": table_tag_yaw(args),
         "size_m": args.tag_size,
         "tag_id": args.tag_id,
+        "mount": args.tag_mount,
+        "height_m": args.tag_height,
     }
 
 
@@ -269,6 +282,9 @@ def target_placement_mismatch(args) -> str | None:
     path = Path(args.target)
     taught_with = json.loads(path.read_text()).get("tag_placement") if path.exists() else None
     now = tag_placement_args(args)
+    if taught_with is not None:
+        # Targets taught before mount support were flat tags.
+        taught_with = {"mount": "flat", "height_m": 0.0, **taught_with}
     if taught_with is not None and taught_with != now:
         return f"target was taught with tag placement {taught_with}, now using {now}"
     return None
@@ -399,10 +415,26 @@ def table_args(sp) -> None:
         "--tag-yaw-deg",
         type=float,
         default=None,
-        help="Tag yaw in the table frame (default: the value used for calibrate-extrinsics)",
+        help="Rotation of the printed tag about its face normal. Default: flat = value used for "
+        "calibrate-extrinsics; vertical = 0 (printed top up)",
     )
     sp.add_argument(
-        "--tag-edge-offset", type=float, required=True, help="Tag centre distance from the front edge (m)"
+        "--tag-mount",
+        choices=TAG_MOUNTS,
+        default="flat",
+        help="flat: lying on the tabletop. vertical: hung on the front edge, facing the robot",
+    )
+    sp.add_argument(
+        "--tag-edge-offset",
+        type=float,
+        required=True,
+        help="Tag centre distance from the front edge into the table (m); ~0 for a vertical tag on the edge",
+    )
+    sp.add_argument(
+        "--tag-height",
+        type=float,
+        default=0.0,
+        help="Vertical mount: tag centre height relative to the tabletop (m), negative = below the top",
     )
     sp.add_argument(
         "--tag-lateral", type=float, default=0.0, help="Tag centre left of the work-region centre (m)"

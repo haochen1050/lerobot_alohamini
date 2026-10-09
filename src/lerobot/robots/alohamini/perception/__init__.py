@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .apriltag_table_estimator import AprilTagDetector, AprilTagTableEstimator, TagPlacement
+from .apriltag_table_estimator import TAG_MOUNTS, AprilTagDetector, AprilTagTableEstimator, TagPlacement
 from .camera_calibration import (
     CameraIntrinsics,
     CharucoSpec,
@@ -34,6 +34,7 @@ from .table_pose import (
 )
 
 __all__ = [
+    "TAG_MOUNTS",
     "AprilTagDetector",
     "AprilTagTableEstimator",
     "CameraIntrinsics",
