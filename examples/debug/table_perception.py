@@ -31,6 +31,7 @@ import logging
 import math
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 
 import cv2
@@ -318,6 +319,7 @@ def cmd_teach(args) -> None:
     cam = LatestFrame(args.camera, *intr.image_size)
     estimator = make_estimator(args, cam, TableTarget(reference_x_m=args.reference_x))
     samples: list[TableMeasurement] = []
+    rejected: Counter[str] = Counter()
     try:
         cam.wait_first()
         last_t = None
@@ -328,12 +330,16 @@ def cmd_teach(args) -> None:
                 time.sleep(0.01)
                 continue
             last_t = frame[1]
-            if estimator.estimate(*frame).valid:
+            err = estimator.estimate(*frame)
+            if err.valid:
                 samples.append(measure_table_pose(estimator.last_T_base_table, args.reference_x))
+            else:
+                rejected[err.reason] += 1
     finally:
         cam.close()
     if len(samples) < args.frames // 2:
-        raise SystemExit(f"Only {len(samples)} valid measurements; is the tag in view?")
+        reasons = "; ".join(f"{n}x {reason}" for reason, n in rejected.most_common(3)) or "no frames"
+        raise SystemExit(f"Only {len(samples)} valid measurements. Rejected frames: {reasons}")
 
     arr = np.array([[s.distance_m, s.lateral_m, s.heading_deg] for s in samples])
     mean, std = arr.mean(axis=0), arr.std(axis=0)
