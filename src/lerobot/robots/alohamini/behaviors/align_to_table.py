@@ -16,10 +16,13 @@
 
 """Closed-loop base alignment to a table: observe, short bounded pulse, stop, observe again.
 
-States: ESTIMATE -> ALIGN_HEADING -> ALIGN_LATERAL -> ALIGN_DISTANCE -> VERIFY -> BASE_READY, with FAULT on
+States: [SEARCH ->] ESTIMATE -> ALIGN_HEADING -> ALIGN_LATERAL -> ALIGN_DISTANCE -> VERIFY -> BASE_READY, with FAULT on
 lost/stale perception, timeout, step/workspace limits, or an error that grows after a correction (which is
 what a wrong sign looks like). Only the axes in ``AlignConfig.axes`` are corrected and verified, so the
 stages can be brought up one at a time.
+
+If the tag is not usable at the start, SEARCH rotates in place in steps smaller than the camera's field of
+view (turning towards the tag once it is seen) until a valid measurement arrives, or faults after one turn.
 
 Safety limits here are independent of the gains: total commanded travel and rotation are capped, and the
 robot is never commanded closer to the table than the taught distance minus ``max_approach_overshoot_m``.
@@ -44,6 +47,7 @@ ERROR_FIELD = {"heading": "heading_error_deg", "lateral": "lateral_error_m", "di
 
 
 class AlignState(enum.Enum):
+    SEARCH = "SEARCH"
     ESTIMATE = "ESTIMATE"
     ALIGN_HEADING = "ALIGN_HEADING"
     ALIGN_LATERAL = "ALIGN_LATERAL"
@@ -94,11 +98,29 @@ class AlignConfig:
     # Each stage corrects down to this fraction of its tolerance; VERIFY accepts the full tolerance. The
     # margin keeps small disturbances from later stages from pushing a finished axis back out.
     align_fraction: float = 0.5
+    # SEARCH: when the tag is not usable at the start, rotate in place in steps (smaller than the camera's
+    # field of view) until a valid measurement is obtained, or fault after max_search_rotation_deg.
+    search: bool = True
+    # +1 = counter-clockwise (left), -1 = clockwise, used while the tag is not in view at all.
+    search_direction: int = 1
+    search_speed_degps: float = 15.0
+    search_step_deg: float = 15.0
+    max_search_rotation_deg: float = 360.0
+    # A tag seen within this bearing of straight ahead but still unusable is a fault, not something to turn to.
+    search_center_deg: float = 10.0
+    search_frames_per_look: int = 5
+
+    @property
+    def max_pulse_s(self) -> float:
+        """Longest pulse this config commands (alignment pulses or search steps)."""
+        return max(self.pulse_s, self.search_step_deg / self.search_speed_degps if self.search else 0.0)
 
     def __post_init__(self) -> None:
         unknown = set(self.axes) - set(AXES)
         if unknown or not self.axes:
             raise ValueError(f"axes must be a non-empty subset of {AXES}, got {self.axes}")
+        if self.search_direction not in (1, -1):
+            raise ValueError("search_direction must be +1 (CCW) or -1 (CW)")
 
     def axis(self, name: str) -> AxisConfig:
         return getattr(self, name)
@@ -150,14 +172,17 @@ class AlignToTable:
         result = AlignResult(AlignState.ESTIMATE)
         self._events = result.events
         self._travel = {"x": 0.0, "y": 0.0, "theta": 0.0}
-        start = self._clock()
         # Frames captured before this time may show the robot moving.
-        self._motion_end = start
+        self._motion_end = self._clock()
         verified = 0
         state = AlignState.ESTIMATE
         self._event("start", config=asdict(cfg))
 
         try:
+            if cfg.search:
+                self._search()
+            # Alignment timeout and travel limits apply from here; the search has its own rotation budget.
+            start = self._clock()
             err = self._measure()
             while True:
                 if self._clock() - start > cfg.timeout_s:
@@ -226,8 +251,12 @@ class AlignToTable:
             and abs(getattr(err, ERROR_FIELD[axis])) > self.config.axis(axis).tolerance
         ]
 
-    def _measure(self) -> TablePoseError:
-        """Median of fresh valid samples captured after the robot settled."""
+    def _fresh_frames(self):
+        """Yield estimator results for frames captured after the robot settled, until the caller stops.
+
+        Raises a fault if no fresh frame arrives within ``measurement_timeout_s``; ``self._last_reason``
+        holds why the most recent frame was unusable.
+        """
         cfg = self.config
         not_before = self._motion_end + cfg.settle_s
         wait = not_before - self._clock()
@@ -235,22 +264,30 @@ class AlignToTable:
             self._sleep(wait)
 
         deadline = self._clock() + cfg.measurement_timeout_s
-        samples: list[TablePoseError] = []
-        last_reason, last_ts = "no frame", None
-        while len(samples) < cfg.samples_per_measurement:
+        self._last_reason, last_ts = "no frame", None
+        while True:
             if self._clock() > deadline:
-                raise _FaultError(f"perception lost: {last_reason}")
+                raise _FaultError(f"perception lost: {self._last_reason}")
             err = self.estimator.get_table_pose_error()
             if err.timestamp_s < not_before or err.timestamp_s == last_ts:
-                last_reason = "no fresh frame since last motion"
+                self._last_reason = "no fresh frame since last motion"
                 self._sleep(0.02)
                 continue
             last_ts = err.timestamp_s
             if not err.valid:
-                last_reason = err.reason
+                self._last_reason = err.reason
+            yield err
+            if not err.valid:
                 self._sleep(0.02)
-                continue
-            samples.append(err)
+
+    def _measure(self) -> TablePoseError:
+        """Median of fresh valid samples captured after the robot settled."""
+        samples: list[TablePoseError] = []
+        for err in self._fresh_frames():
+            if err.valid:
+                samples.append(err)
+                if len(samples) >= self.config.samples_per_measurement:
+                    break
 
         merged = TablePoseError(
             distance_error_m=statistics.median(s.distance_error_m for s in samples),
@@ -261,6 +298,53 @@ class AlignToTable:
         )
         self._event("measure", error=asdict(merged))
         return merged
+
+    def _look(self) -> tuple[str, float | None]:
+        """('valid' | 'seen' | 'none', tag bearing) over a few fresh frames at the current heading."""
+        bearings: list[float] = []
+        for looked, err in enumerate(self._fresh_frames(), start=1):
+            bearing = getattr(self.estimator, "last_tag_bearing_deg", None)
+            if err.valid:
+                return "valid", bearing
+            if bearing is not None:
+                bearings.append(bearing)
+            if looked >= self.config.search_frames_per_look:
+                break
+        if bearings:
+            return "seen", statistics.median(bearings)
+        return "none", None
+
+    def _search(self) -> None:
+        cfg = self.config
+        if not hasattr(self.estimator, "last_tag_bearing_deg"):
+            self._event("search_skipped", reason="estimator does not report tag bearing")
+            return
+        rotated = 0.0
+        while True:
+            status, bearing = self._look()
+            if status == "valid":
+                self._event("search_done", rotated_deg=rotated, bearing_deg=bearing)
+                return
+            if status == "seen":
+                if abs(bearing) <= cfg.search_center_deg:
+                    raise _FaultError(
+                        f"tag found ahead (bearing {bearing:+.0f} deg) but unusable: {self._last_reason}"
+                    )
+                # Turn towards the tag, at most one step.
+                angle = max(-cfg.search_step_deg, min(cfg.search_step_deg, bearing))
+            else:
+                angle = cfg.search_direction * cfg.search_step_deg
+            if rotated + abs(angle) > cfg.max_search_rotation_deg:
+                raise _FaultError(f"tag not found after rotating {rotated:.0f} deg: {self._last_reason}")
+
+            speed = math.copysign(cfg.search_speed_degps, angle)
+            duration = abs(angle) / cfg.search_speed_degps
+            self._event(
+                "search_pulse", status=status, bearing_deg=bearing, omega_degps=speed, duration_s=duration
+            )
+            self.base.move_base_for(0.0, 0.0, speed, duration)
+            self._motion_end = self._clock()
+            rotated += abs(angle)
 
     def _step(self, axis: str, err: TablePoseError) -> TablePoseError:
         cfg, ax = self.config, self.config.axis(axis)

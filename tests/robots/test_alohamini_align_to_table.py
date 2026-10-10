@@ -219,3 +219,108 @@ def test_keyboard_interrupt_stops_base():
 def test_invalid_axes_rejected():
     with pytest.raises(ValueError):
         AlignConfig(axes=("yaw",))
+
+
+# ---------------------------------------------------------------- SEARCH
+
+
+class FovWorld(SimWorld):
+    """SimWorld whose camera only sees the tag within +-fov_deg of straight ahead, and reports its bearing."""
+
+    def __init__(self, *args, fov_deg=31.0, max_heading_deg=45.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fov_deg = fov_deg
+        self.max_heading_deg = max_heading_deg
+        self.last_tag_bearing_deg = None
+
+    def get_table_pose_error(self):
+        self.calls += 1
+        self.t += 0.033
+        base_table = invert(pose_xyz_yaw(self.x, self.y, 0, math.degrees(self.yaw)))
+        tag_x, tag_y = base_table[0, 3], base_table[1, 3]
+        bearing = math.degrees(math.atan2(tag_y, tag_x))
+        if abs(bearing) > self.fov_deg or tag_x <= 0:
+            self.last_tag_bearing_deg = None
+            return TablePoseError.invalid(self.t, "expected one tag, saw []")
+        self.last_tag_bearing_deg = bearing
+        err = table_pose_error(base_table, TARGET, self.t)
+        if abs(err.heading_error_deg) > self.max_heading_deg:
+            return TablePoseError.invalid(self.t, "table heading exceeds +-45")
+        return err
+
+
+@pytest.mark.parametrize(("yaw", "direction"), [(90.0, 1), (90.0, -1), (-150.0, 1), (60.0, -1)])
+def test_search_finds_tag_then_aligns(yaw, direction):
+    world = FovWorld(x=-0.36, y=0.03, yaw_deg=yaw)
+    result = run(world, search_direction=direction)
+
+    assert result.ready, result.reason
+    err = world.true_error()
+    assert abs(err.heading_error_deg) <= 2.0
+    search = [e for e in result.events if e["event"] == "search_pulse"]
+    assert search, "should have searched"
+    # Search pulses are pure rotation at <= 15 deg/s and never longer than a 15 deg step.
+    assert all(abs(e["omega_degps"]) <= 15.0 and e["duration_s"] <= 1.0 + 1e-9 for e in search)
+    assert sum(abs(e["omega_degps"]) * e["duration_s"] for e in search) <= 360.0 + 1e-6
+    # While the tag was not visible, it turned in the requested direction.
+    blind = [e for e in search if e["status"] == "none"]
+    assert all(math.copysign(1, e["omega_degps"]) == direction for e in blind)
+
+
+def test_search_turns_towards_a_tag_it_can_see_but_not_use():
+    # Turned 60 deg CCW with a wide camera: the tag is seen to the right but the heading check rejects it,
+    # so the search must turn towards it (clockwise) rather than in the default search direction.
+    world = FovWorld(x=-0.36, y=0.0, yaw_deg=60.0, fov_deg=80.0)
+    result = run(world, search_direction=1)  # default direction would turn the wrong way
+    assert result.ready, result.reason
+    seen = [e for e in result.events if e["event"] == "search_pulse" and e["status"] == "seen"]
+    assert seen and all(e["omega_degps"] < 0 for e in seen)  # turned clockwise, towards the tag
+
+
+def test_search_gives_up_after_one_turn():
+    world = FovWorld(yaw_deg=180.0, fov_deg=31.0)
+    world.lost_after = 0  # tag never detected anywhere
+
+    def never(*_args):
+        world.calls += 1
+        world.t += 0.033
+        world.last_tag_bearing_deg = None
+        return TablePoseError.invalid(world.t, "expected one tag, saw []")
+
+    world.get_table_pose_error = never
+    result = run(world)
+    assert result.state is AlignState.FAULT
+    assert "not found after rotating" in result.reason
+    total = sum(abs(w) * d for _vx, _vy, w, d in world.pulses)
+    assert total <= 360.0 + 1e-6
+    assert world.stops >= 1
+
+
+def test_tag_ahead_but_unusable_faults_instead_of_spinning():
+    world = FovWorld(yaw_deg=0.0)
+
+    def unusable(*_args):
+        world.calls += 1
+        world.t += 0.033
+        world.last_tag_bearing_deg = 2.0
+        return TablePoseError.invalid(world.t, "tag tilted 90 deg")
+
+    world.get_table_pose_error = unusable
+    result = run(world)
+    assert result.state is AlignState.FAULT
+    assert "unusable" in result.reason and "tilted" in result.reason
+    assert world.pulses == []
+
+
+def test_search_disabled_faults_immediately():
+    world = FovWorld(yaw_deg=90.0)
+    result = run(world, search=False)
+    assert result.state is AlignState.FAULT
+    assert "perception lost" in result.reason
+    assert world.pulses == []
+
+
+def test_search_rotation_does_not_count_against_alignment_limits():
+    world = FovWorld(x=-0.33, yaw_deg=120.0)
+    result = run(world, max_total_rotation_deg=30.0)
+    assert result.ready, result.reason

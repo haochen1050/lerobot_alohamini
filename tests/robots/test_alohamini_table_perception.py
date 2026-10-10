@@ -237,6 +237,32 @@ def test_vertical_tag_rotated_in_its_plane_is_rejected(rotation_deg):
     assert not est.estimate(image, 0.0).valid
 
 
+@pytest.mark.parametrize("yaw_deg", [0.0, 15.0, -20.0])
+def test_tag_bearing_reported_even_for_rejected_frames(yaw_deg):
+    placement = TagPlacement(x_m=0.12, tag_id=3)
+    # Robot turned by yaw_deg relative to the table: the tag appears at bearing ~ -yaw_deg.
+    T_base_table = pose_xyz_yaw(0.0, 0.0, 0.0, -yaw_deg) @ pose_xyz_yaw(0.55, 0.0, 0.75, 0)
+    T_base_tag = T_base_table @ placement.T_table_tag()
+    expected = math.degrees(math.atan2(T_base_tag[1, 3], T_base_tag[0, 3] - T_BASE_CAM[0, 3]))
+    image = render_tag(T_base_tag)
+
+    est = AprilTagTableEstimator(INTRINSICS, T_BASE_CAM, placement, TableTarget(), clock=lambda: 0.0)
+    assert est.estimate(image, 0.0).valid
+    assert est.last_tag_bearing_deg == pytest.approx(expected, abs=1.0)
+
+    # Same view, but a heading limit that rejects it: the bearing is still available for a search.
+    strict = AprilTagTableEstimator(
+        INTRINSICS, T_BASE_CAM, placement, TableTarget(), clock=lambda: 0.0, max_heading_deg=1.0
+    )
+    if abs(yaw_deg) > 1.0:
+        assert not strict.estimate(image, 0.0).valid
+        assert strict.last_tag_bearing_deg == pytest.approx(expected, abs=1.0)
+
+    blank = np.full((H, W, 3), 90, np.uint8)
+    est.estimate(blank, 0.0)
+    assert est.last_tag_bearing_deg is None
+
+
 def test_unknown_mount_rejected():
     with pytest.raises(ValueError):
         TagPlacement(x_m=0.0, mount="ceiling")

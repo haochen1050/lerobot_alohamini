@@ -175,6 +175,10 @@ class AprilTagTableEstimator(TablePoseEstimator):
         # Last accepted tag / table poses in the base frame, for logging and target teaching.
         self.last_T_base_tag: np.ndarray | None = None
         self.last_T_base_table: np.ndarray | None = None
+        # Horizontal bearing of the tag from the camera in the base frame (+ = to the robot's left), for
+        # the last processed frame; None when the tag was not detected. Set even when the frame is rejected
+        # by a later check, so a search can turn towards a tag it can see but not yet use.
+        self.last_tag_bearing_deg: float | None = None
 
     def get_table_pose_error(self) -> TablePoseError:
         frame = self.frame_source() if self.frame_source is not None else None
@@ -182,7 +186,15 @@ class AprilTagTableEstimator(TablePoseEstimator):
             return TablePoseError.invalid(self.clock(), "no camera frame")
         return self.estimate(*frame)
 
+    def _bearing_deg(self, corners: np.ndarray) -> float:
+        """Bearing of the tag centre's viewing ray, projected onto the floor plane of the base frame."""
+        centre = corners.reshape(-1, 1, 2).mean(axis=0, keepdims=True).astype(np.float64)
+        x, y = cv2.undistortPoints(centre, self.intrinsics.camera_matrix, self.intrinsics.dist_coeffs).ravel()
+        ray = self.T_base_cam[:3, :3] @ np.array([x, y, 1.0])
+        return math.degrees(math.atan2(ray[1], ray[0]))
+
     def estimate(self, image: np.ndarray, capture_time_s: float) -> TablePoseError:
+        self.last_tag_bearing_deg = None
         age = self.clock() - capture_time_s
         if age > self.max_age_s:
             return TablePoseError.invalid(capture_time_s, f"stale frame ({age:.2f}s old)")
@@ -195,6 +207,7 @@ class AprilTagTableEstimator(TablePoseEstimator):
         detections = self.detector.detect(image)
         wanted = self.placement.tag_id
         matches = [d for d in detections if wanted is None or d[0] == wanted]
+        self.last_tag_bearing_deg = self._bearing_deg(matches[0][1]) if len(matches) == 1 else None
         if len(matches) != 1:
             seen = [d[0] for d in detections]
             expected = "one tag" if wanted is None else f"tag {wanted}"

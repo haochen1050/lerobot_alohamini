@@ -66,6 +66,13 @@ def parse_args():
     p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
     p.add_argument("--log-dir", default=str(OUT / "logs"))
     p.add_argument("--timeout-s", type=float, default=AlignConfig.timeout_s, help="Overall alignment timeout")
+    p.add_argument("--no-search", action="store_true", help="Fault instead of rotating to find the tag")
+    p.add_argument(
+        "--search-direction",
+        choices=("ccw", "cw"),
+        default="ccw",
+        help="Rotation direction while the tag is not in view (viewed from above)",
+    )
     return p.parse_args()
 
 
@@ -76,7 +83,12 @@ def main() -> int:
     signal.signal(signal.SIGHUP, _raise_interrupt)
 
     axes = tuple(a.strip() for a in args.axes.split(",") if a.strip())
-    config = AlignConfig(axes=axes, timeout_s=args.timeout_s)
+    config = AlignConfig(
+        axes=axes,
+        timeout_s=args.timeout_s,
+        search=not args.no_search,
+        search_direction=1 if args.search_direction == "ccw" else -1,
+    )
 
     if not Path(args.target).exists():
         raise SystemExit(f"No taught target at {args.target}; run table_perception.py teach first")
@@ -91,20 +103,30 @@ def main() -> int:
         cam.wait_first()
         time.sleep(0.5)
         err = estimator.get_table_pose_error()
-        if not err.valid:
+        if err.valid:
+            print(
+                f"Current error: distance {err.distance_error_m * 100:+.1f} cm, "
+                f"lateral {err.lateral_error_m * 100:+.1f} cm, heading {err.heading_error_deg:+.1f} deg. "
+                f"Correcting: {', '.join(axes)}"
+            )
+        elif config.search:
+            print(
+                f"Tag not usable yet ({err.reason}). Will rotate {args.search_direction.upper()} in "
+                f"{config.search_step_deg:g} deg steps at {config.search_speed_degps:g} deg/s to find it "
+                f"(up to {config.max_search_rotation_deg:g} deg), then align: {', '.join(axes)}"
+            )
+        else:
             raise SystemExit(f"Table pose invalid before starting: {err.reason}")
-        print(
-            f"Current error: distance {err.distance_error_m * 100:+.1f} cm, lateral {err.lateral_error_m * 100:+.1f} cm, "
-            f"heading {err.heading_error_deg:+.1f} deg. Correcting: {', '.join(axes)}"
-        )
+
         if args.dry_run:
-            for axis in axes:
-                ax, e = config.axis(axis), getattr(err, ERROR_FIELD[axis])
-                if abs(e) <= ax.tolerance:
-                    plan = "within tolerance"
-                else:
-                    plan = f"first pulse speed {max(-ax.max_speed, min(ax.max_speed, ax.gain * e)):+.3f}"
-                print(f"  {axis}: error {e:+.3f}, tolerance {ax.tolerance}, {plan}")
+            if err.valid:
+                for axis in axes:
+                    ax, e = config.axis(axis), getattr(err, ERROR_FIELD[axis])
+                    if abs(e) <= ax.tolerance:
+                        plan = "within tolerance"
+                    else:
+                        plan = f"first pulse speed {max(-ax.max_speed, min(ax.max_speed, ax.gain * e)):+.3f}"
+                    print(f"  {axis}: error {e:+.3f}, tolerance {ax.tolerance}, {plan}")
             print("Dry run: no motion.")
             return 0
 
@@ -123,7 +145,7 @@ def main() -> int:
                 max_vx_mps=config.distance.max_speed,
                 max_vy_mps=config.lateral.max_speed,
                 max_omega_degps=config.heading.max_speed,
-                max_pulse_s=config.pulse_s,
+                max_pulse_s=config.max_pulse_s,
             ),
         )
 
