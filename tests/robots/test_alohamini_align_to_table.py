@@ -324,3 +324,108 @@ def test_search_rotation_does_not_count_against_alignment_limits():
     world = FovWorld(x=-0.33, yaw_deg=120.0)
     result = run(world, max_total_rotation_deg=30.0)
     assert result.ready, result.reason
+
+
+# ---------------------------------------------------------------- ORBIT
+
+
+class OrbitWorld(FovWorld):
+    """FovWorld that also exposes the raw table pose (even beyond the heading limit) and the target."""
+
+    target = TARGET
+
+    def get_table_pose_error(self):
+        err = super().get_table_pose_error()
+        visible = self.last_tag_bearing_deg is not None
+        self.last_raw_T_base_table = (
+            invert(pose_xyz_yaw(self.x, self.y, 0, math.degrees(self.yaw))) if visible else None
+        )
+        return err
+
+
+def displaced(theta_deg, radius=0.6, extra_turn_deg=0.0, **kwargs):
+    """Robot `theta_deg` around the approach point (CCW seen from above), facing it, then turned extra."""
+    t = math.radians(theta_deg)
+    return OrbitWorld(
+        x=-radius * math.cos(t), y=-radius * math.sin(t), yaw_deg=theta_deg + extra_turn_deg, **kwargs
+    )
+
+
+@pytest.mark.parametrize("theta", [54.0, -54.0, 30.0, -60.0, 15.0])
+def test_orbit_brings_displaced_robot_in_front_then_aligns(theta):
+    world = displaced(theta)
+    start_distance_to_edge = -world.x
+    edge_distances = []
+    original = world.move_base_for
+
+    def move(*args):
+        result = original(*args)
+        edge_distances.append(-world.x)
+        return result
+
+    world.move_base_for = move
+    result = run(world)
+
+    assert result.ready, result.reason
+    err = world.true_error()
+    assert abs(err.heading_error_deg) <= 2.0
+    assert abs(err.lateral_error_m) <= 0.02
+    assert abs(err.distance_error_m) <= 0.02
+
+    orbit = [e for e in result.events if e["event"] == "orbit_pulse"]
+    assert orbit
+    assert sum(abs(e["command"][2]) * e["duration_s"] for e in orbit) <= 90.0 + 1e-6
+    for e in orbit:
+        vx, vy, w = e["command"]
+        assert math.hypot(vx, vy) <= 0.05 + 1e-9
+        assert abs(w) <= 10.0 + 1e-9
+        assert e["duration_s"] <= 1.0 + 1e-9
+    # Orbiting towards the approach axis only moves the robot away from the edge line.
+    n_orbit = len(orbit)
+    assert min(edge_distances[:n_orbit]) >= start_distance_to_edge - 1e-6
+
+
+def test_search_then_orbit_when_displaced_and_turned_away():
+    world = displaced(50.0, extra_turn_deg=70.0)  # tag out of view and robot off to the side
+    result = run(world, search_direction=-1)
+    assert result.ready, result.reason
+    kinds = [e["event"] for e in result.events]
+    assert "search_pulse" in kinds and "orbit_pulse" in kinds
+    assert kinds.index("search_pulse") < kinds.index("orbit_pulse")
+
+
+def test_orbit_refuses_turned_tag_signature():
+    world = displaced(85.0)
+    result = run(world)
+    assert result.state is AlignState.FAULT
+    assert "tag was turned" in result.reason
+    assert world.pulses == []
+
+
+def test_orbit_faults_when_robot_does_not_follow():
+    world = displaced(50.0, efficiency=0.05)  # wheels slipping: off-angle barely changes
+    result = run(world)
+    assert result.state is AlignState.FAULT
+    assert "did not reduce" in result.reason
+    assert len([e for e in result.events if e["event"] == "orbit_pulse"]) == 1
+
+
+def test_orbit_refuses_when_too_close():
+    world = displaced(40.0, radius=0.22)
+    result = run(world)
+    assert result.state is AlignState.FAULT
+    assert "too close" in result.reason
+
+
+def test_orbit_disabled_leaves_large_offsets_to_fault():
+    world = displaced(54.0)
+    result = run(world, orbit=False)
+    assert result.state is AlignState.FAULT
+
+
+def test_merely_rotated_robot_is_not_orbited():
+    # Straight in front of the table, just turned 25 deg: rotation is the heading stage's job, not the orbit's.
+    world = displaced(0.0, radius=0.5, extra_turn_deg=25.0)
+    result = run(world)
+    assert result.ready, result.reason
+    assert not [e for e in result.events if e["event"] == "orbit_pulse"]

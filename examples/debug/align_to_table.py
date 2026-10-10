@@ -15,6 +15,10 @@ in a verified stop; any lost/stale tag, timeout, or error that grows after a cor
   python examples/debug/align_to_table.py --tag-edge-offset 0.15 --axes heading --dry-run
   python examples/debug/align_to_table.py --tag-edge-offset 0.15 --axes heading
 
+If the tag is not usable at the start, the robot first rotates in place to find it (--search-direction), and
+if it stands off to the side of the table's approach line it circles the approach point at constant distance
+until it is roughly in front (--no-search / --no-orbit disable these).
+
 A JSONL log of every measurement, pulse, stop and state transition is written per trial.
 """
 
@@ -68,6 +72,11 @@ def parse_args():
     p.add_argument("--timeout-s", type=float, default=AlignConfig.timeout_s, help="Overall alignment timeout")
     p.add_argument("--no-search", action="store_true", help="Fault instead of rotating to find the tag")
     p.add_argument(
+        "--no-orbit",
+        action="store_true",
+        help="Do not circle the table to correct a robot standing off to the side of the approach line",
+    )
+    p.add_argument(
         "--search-direction",
         choices=("ccw", "cw"),
         default="ccw",
@@ -87,6 +96,7 @@ def main() -> int:
         axes=axes,
         timeout_s=args.timeout_s,
         search=not args.no_search,
+        orbit=not args.no_orbit,
         search_direction=1 if args.search_direction == "ccw" else -1,
     )
 

@@ -16,13 +16,15 @@
 
 """Closed-loop base alignment to a table: observe, short bounded pulse, stop, observe again.
 
-States: [SEARCH ->] ESTIMATE -> ALIGN_HEADING -> ALIGN_LATERAL -> ALIGN_DISTANCE -> VERIFY -> BASE_READY, with FAULT on
+States: [SEARCH ->] [ORBIT ->] ESTIMATE -> ALIGN_HEADING -> ALIGN_LATERAL -> ALIGN_DISTANCE -> VERIFY -> BASE_READY, with FAULT on
 lost/stale perception, timeout, step/workspace limits, or an error that grows after a correction (which is
 what a wrong sign looks like). Only the axes in ``AlignConfig.axes`` are corrected and verified, so the
 stages can be brought up one at a time.
 
 If the tag is not usable at the start, SEARCH rotates in place in steps smaller than the camera's field of
 view (turning towards the tag once it is seen) until a valid measurement arrives, or faults after one turn.
+If the robot is then far off the table's approach direction (displaced, not just turned), ORBIT circles the
+approach point at constant distance, facing the table, until the remaining offset is small.
 
 Safety limits here are independent of the gains: total commanded travel and rotation are capped, and the
 robot is never commanded closer to the table than the taught distance minus ``max_approach_overshoot_m``.
@@ -37,8 +39,10 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+import numpy as np
+
 from ..base import BaseController, BaseStopError
-from ..perception import TablePoseError, TablePoseEstimator
+from ..perception import TablePoseError, TablePoseEstimator, measure_table_pose
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +52,7 @@ ERROR_FIELD = {"heading": "heading_error_deg", "lateral": "lateral_error_m", "di
 
 class AlignState(enum.Enum):
     SEARCH = "SEARCH"
+    ORBIT = "ORBIT"
     ESTIMATE = "ESTIMATE"
     ALIGN_HEADING = "ALIGN_HEADING"
     ALIGN_LATERAL = "ALIGN_LATERAL"
@@ -109,11 +114,27 @@ class AlignConfig:
     # A tag seen within this bearing of straight ahead but still unusable is a fault, not something to turn to.
     search_center_deg: float = 10.0
     search_frames_per_look: int = 5
+    # ORBIT: when the robot stands more than orbit_trigger_deg around the table from the taught approach line
+    # (displaced, not just turned), circle the approach point (table frame origin) at constant distance until
+    # within orbit_exit_deg; the per-axis stages then finish. Each step must reduce the angle.
+    orbit: bool = True
+    orbit_trigger_deg: float = 10.0
+    orbit_exit_deg: float = 3.0
+    orbit_step_deg: float = 10.0
+    orbit_speed_degps: float = 10.0
+    orbit_max_linear_mps: float = 0.05
+    orbit_min_distance_m: float = 0.25
+    # Angles beyond this look like a turned tag rather than a displaced robot: fault instead.
+    max_orbit_angle_deg: float = 75.0
+    max_orbit_total_deg: float = 90.0
+    orbit_max_pulse_s: float = 1.0
 
     @property
     def max_pulse_s(self) -> float:
-        """Longest pulse this config commands (alignment pulses or search steps)."""
-        return max(self.pulse_s, self.search_step_deg / self.search_speed_degps if self.search else 0.0)
+        """Longest pulse this config commands (alignment, search or orbit)."""
+        search = self.search_step_deg / self.search_speed_degps if self.search else 0.0
+        orbit = self.orbit_max_pulse_s if self.orbit else 0.0
+        return max(self.pulse_s, search, orbit)
 
     def __post_init__(self) -> None:
         unknown = set(self.axes) - set(AXES)
@@ -181,6 +202,8 @@ class AlignToTable:
         try:
             if cfg.search:
                 self._search()
+            if cfg.orbit:
+                self._orbit()
             # Alignment timeout and travel limits apply from here; the search has its own rotation budget.
             start = self._clock()
             err = self._measure()
@@ -302,12 +325,15 @@ class AlignToTable:
     def _look(self) -> tuple[str, float | None]:
         """('valid' | 'seen' | 'none', tag bearing) over a few fresh frames at the current heading."""
         bearings: list[float] = []
+        self._raw_seen = False
         for looked, err in enumerate(self._fresh_frames(), start=1):
             bearing = getattr(self.estimator, "last_tag_bearing_deg", None)
             if err.valid:
                 return "valid", bearing
             if bearing is not None:
                 bearings.append(bearing)
+            if getattr(self.estimator, "last_raw_T_base_table", None) is not None:
+                self._raw_seen = True
             if looked >= self.config.search_frames_per_look:
                 break
         if bearings:
@@ -326,6 +352,10 @@ class AlignToTable:
                 self._event("search_done", rotated_deg=rotated, bearing_deg=bearing)
                 return
             if status == "seen":
+                if cfg.orbit and self._raw_seen:
+                    # Tag fitted fine but the robot is off to the side: the orbit approach takes over.
+                    self._event("search_done", rotated_deg=rotated, bearing_deg=bearing, needs_orbit=True)
+                    return
                 if abs(bearing) <= cfg.search_center_deg:
                     raise _FaultError(
                         f"tag found ahead (bearing {bearing:+.0f} deg) but unusable: {self._last_reason}"
@@ -345,6 +375,77 @@ class AlignToTable:
             self.base.move_base_for(0.0, 0.0, speed, duration)
             self._motion_end = self._clock()
             rotated += abs(angle)
+
+    def _orbit_state(self) -> tuple[float, float, np.ndarray]:
+        """(angle around the approach point minus the taught one [deg], distance to the edge [m], approach
+        point xy in base) from fresh frames, ignoring the heading limit."""
+        target = self.estimator.target
+        taught = math.degrees(math.atan2(target.lateral_m, target.distance_m))
+        samples: list[tuple[float, float, np.ndarray]] = []
+        for looked, _err in enumerate(self._fresh_frames(), start=1):
+            raw = getattr(self.estimator, "last_raw_T_base_table", None)
+            if raw is not None:
+                m = measure_table_pose(raw, target.reference_x_m, target.reference_y_m)
+                if m is not None:
+                    angle = math.degrees(math.atan2(m.lateral_m, m.distance_m)) - taught
+                    samples.append((angle, m.distance_m, raw[:2, 3].copy()))
+                    if len(samples) >= self.config.samples_per_measurement:
+                        break
+            if looked >= 4 * self.config.samples_per_measurement and not samples:
+                raise _FaultError(f"perception lost during orbit: {self._last_reason}")
+        samples.sort(key=lambda sample: sample[0])
+        return samples[len(samples) // 2]
+
+    def _orbit(self) -> None:
+        cfg = self.config
+        if not hasattr(self.estimator, "last_raw_T_base_table") or not hasattr(self.estimator, "target"):
+            self._event("orbit_skipped", reason="estimator does not expose the raw table pose")
+            return
+        orbited = 0.0
+        angle_err, distance, pivot = self._orbit_state()
+        if abs(angle_err) <= cfg.orbit_trigger_deg:
+            return
+        while abs(angle_err) > cfg.orbit_exit_deg:
+            if abs(angle_err) > cfg.max_orbit_angle_deg:
+                raise _FaultError(
+                    f"robot {angle_err:+.0f} deg around the table from the approach line (limit "
+                    f"{cfg.max_orbit_angle_deg:g}); if the robot is roughly in front, the tag was turned"
+                )
+            if distance < cfg.orbit_min_distance_m:
+                raise _FaultError(f"too close to the table to orbit safely ({distance * 100:.0f} cm)")
+            radius = float(np.hypot(*pivot))
+            # Slow down on large radii so the base's linear speed stays bounded, and keep pulses short.
+            omega_deg = min(cfg.orbit_speed_degps, math.degrees(cfg.orbit_max_linear_mps / radius))
+            step = min(cfg.orbit_step_deg, omega_deg * cfg.orbit_max_pulse_s)
+            # Orbiting by +a (CCW) about the approach point decreases the angle error by a.
+            orbit = max(-step, min(step, angle_err))
+            if orbited + abs(orbit) > cfg.max_orbit_total_deg:
+                raise _FaultError(f"orbit limit: {orbited:.0f} deg orbited, still {angle_err:+.0f} deg off")
+            omega_deg = math.copysign(omega_deg, orbit)
+            omega = math.radians(omega_deg)
+            # Body twist whose instantaneous centre of rotation is the approach point (x0, y0):
+            # ICR = (-vy / w, vx / w)  =>  vx = y0 * w, vy = -x0 * w.
+            vx, vy = pivot[1] * omega, -pivot[0] * omega
+            duration = abs(orbit) / abs(omega_deg)
+            self._event(
+                "orbit_pulse",
+                angle_error_deg=angle_err,
+                radius_m=radius,
+                command=(vx, vy, omega_deg),
+                duration_s=duration,
+            )
+            self.base.move_base_for(vx, vy, omega_deg, duration)
+            self._motion_end = self._clock()
+            orbited += abs(orbit)
+
+            new_err, distance, pivot = self._orbit_state()
+            if abs(new_err) > abs(angle_err) - 0.3 * abs(orbit):
+                raise _FaultError(
+                    f"orbit did not reduce the angle ({angle_err:+.1f} -> {new_err:+.1f} deg after a "
+                    f"{orbit:+.1f} deg step): slipping, or the tag moved"
+                )
+            angle_err = new_err
+        self._event("orbit_done", orbited_deg=orbited, angle_error_deg=angle_err)
 
     def _step(self, axis: str, err: TablePoseError) -> TablePoseError:
         cfg, ax = self.config, self.config.axis(axis)

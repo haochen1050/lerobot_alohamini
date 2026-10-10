@@ -179,6 +179,9 @@ class AprilTagTableEstimator(TablePoseEstimator):
         # the last processed frame; None when the tag was not detected. Set even when the frame is rejected
         # by a later check, so a search can turn towards a tag it can see but not yet use.
         self.last_tag_bearing_deg: float | None = None
+        # Table pose from the last frame whose tag passed the fit/orientation checks, even if the heading
+        # limit then rejected it. Lets the orbit approach work from beyond max_heading_deg.
+        self.last_raw_T_base_table: np.ndarray | None = None
 
     def get_table_pose_error(self) -> TablePoseError:
         frame = self.frame_source() if self.frame_source is not None else None
@@ -195,6 +198,7 @@ class AprilTagTableEstimator(TablePoseEstimator):
 
     def estimate(self, image: np.ndarray, capture_time_s: float) -> TablePoseError:
         self.last_tag_bearing_deg = None
+        self.last_raw_T_base_table = None
         age = self.clock() - capture_time_s
         if age > self.max_age_s:
             return TablePoseError.invalid(capture_time_s, f"stale frame ({age:.2f}s old)")
@@ -230,14 +234,19 @@ class AprilTagTableEstimator(TablePoseEstimator):
                 "(check --tag-mount / --tag-yaw-deg)",
             )
 
+        self.last_raw_T_base_table = T_base_table
         heading = math.degrees(math.atan2(T_base_table[1, 0], T_base_table[0, 0]))
         if abs(heading) > self.max_heading_deg:
-            # Alignment starts roughly facing the table, so this almost always means the physical tag is
-            # rotated (by ~90/180 deg) relative to TagPlacement.yaw_deg. Acting on it would flip signs.
+            quarter = 90 * round(heading / 90)
+            if quarter != 0 and abs(heading - quarter) < 20:
+                # Close to a multiple of 90: almost certainly the physical tag is turned relative to
+                # TagPlacement.yaw_deg. Acting on it would send the robot to the wrong side of the tag.
+                hint = f"tag probably rotated ~{quarter:+d} deg relative to its configured yaw"
+            else:
+                hint = "robot is off to the side of the table's approach direction"
             return TablePoseError.invalid(
                 capture_time_s,
-                f"table heading {heading:+.0f} deg exceeds +-{self.max_heading_deg:g}; tag probably rotated "
-                f"~{90 * round(heading / 90):+d} deg relative to its configured yaw",
+                f"table heading {heading:+.0f} deg exceeds +-{self.max_heading_deg:g}; {hint}",
             )
 
         self.last_T_base_tag = T_base_tag
