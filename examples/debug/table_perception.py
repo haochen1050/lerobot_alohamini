@@ -190,26 +190,33 @@ def cmd_realsense_intrinsics(args) -> None:
         raise SystemExit(f"No {args.width}x{args.height} colour stream on this device")
     intr = profiles[0].get_intrinsics()
 
-    coeffs = np.array(intr.coeffs, dtype=float)
-    # OpenCV's model is Brown-Conrady with (k1, k2, p1, p2, k3) - the same order librealsense uses. The
-    # inverse model maps the other way, so it is only usable when it is (numerically) no distortion.
-    if intr.model == rs.distortion.none or (
-        intr.model == rs.distortion.inverse_brown_conrady and np.allclose(coeffs, 0, atol=1e-6)
-    ):
-        coeffs = np.zeros(5)
-    elif intr.model != rs.distortion.brown_conrady:
+    K = np.array([[intr.fx, 0.0, intr.ppx], [0.0, intr.fy, intr.ppy], [0.0, 0.0, 1.0]])
+    coeffs = np.zeros(5) if intr.model == rs.distortion.none else np.array(intr.coeffs[:5], dtype=float)
+    # librealsense's distortion models differ in name from OpenCV's (k1, k2, p1, p2, k3) Brown-Conrady, but
+    # for the D4xx colour stream they project almost identically. Check that numerically over the whole image
+    # instead of trusting the model name.
+    corners = np.array([[0, 0], [intr.width, 0], [0, intr.height], [intr.width, intr.height]], dtype=float)
+    span = np.abs((corners - [intr.ppx, intr.ppy]) / [intr.fx, intr.fy]).max(axis=0)
+    xs, ys = np.meshgrid(np.linspace(-span[0], span[0], 17), np.linspace(-span[1], span[1], 13))
+    rays = np.stack([xs.ravel(), ys.ravel(), np.ones(xs.size)], axis=1)
+    rs_px = np.array([rs.rs2_project_point_to_pixel(intr, ray.tolist()) for ray in rays])
+    cv_px = cv2.projectPoints(rays, np.zeros(3), np.zeros(3), K, coeffs)[0].reshape(-1, 2)
+    mismatch_px = float(np.abs(cv_px - rs_px).max())
+    if mismatch_px > 0.25:
         raise SystemExit(
-            f"Distortion model {intr.model} with coefficients {coeffs.tolist()} is not OpenCV-compatible; "
-            "calibrate with capture-charuco / calibrate-intrinsics instead"
+            f"Distortion model {intr.model} {np.round(coeffs, 4).tolist()} differs from OpenCV's by up to "
+            f"{mismatch_px:.2f} px; calibrate with capture-charuco / calibrate-intrinsics instead"
         )
 
-    K = np.array([[intr.fx, 0.0, intr.ppx], [0.0, intr.fy, intr.ppy], [0.0, 0.0, 1.0]])
     CameraIntrinsics(K, coeffs, (intr.width, intr.height)).save(args.out)
     print(f"{device.get_info(rs.camera_info.name)} serial {device.get_info(rs.camera_info.serial_number)}")
     print(
         f"fx={intr.fx:.1f} fy={intr.fy:.1f} cx={intr.ppx:.1f} cy={intr.ppy:.1f}  size={intr.width}x{intr.height}"
     )
-    print(f"model={intr.model} dist={np.round(coeffs, 4).tolist()}")
+    print(
+        f"model={intr.model} dist={np.round(coeffs, 4).tolist()} "
+        f"(matches OpenCV projection to {mismatch_px:.3f} px)"
+    )
     print(f"Saved {args.out}")
 
 
