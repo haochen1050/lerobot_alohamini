@@ -21,7 +21,8 @@ until it is roughly in front (--no-search / --no-orbit disable these).
 
 Once the tag has been seen, every pulse is planned so the tag stays inside the image (shortened, turned to keep
 looking at the tag, or another axis corrected first), the tag is tracked during the pulse and the pulse ends
-early if it nears the image edge, and if it is lost anyway the pulse is reversed (--no-keep-view disables this).
+early if it nears the image edge, and if it is lost anyway the pulse is reversed and, if needed, the base turns
++-20 deg to find it again (--recover-scan-deg; --no-keep-view disables all of this).
 
 A JSONL log of every measurement, pulse, stop and state transition is written per trial.
 """
@@ -86,6 +87,12 @@ def parse_args():
         help="Do not plan/watch pulses to keep the tag in the image, or reverse a pulse that lost it",
     )
     p.add_argument(
+        "--recover-scan-deg",
+        type=float,
+        default=AlignConfig.recover_scan_deg,
+        help="If the tag is still lost after reversing a pulse, turn up to +- this much to find it (0 = off)",
+    )
+    p.add_argument(
         "--search-direction",
         choices=("ccw", "cw"),
         default="ccw",
@@ -107,6 +114,7 @@ def main() -> int:
         search=not args.no_search,
         orbit=not args.no_orbit,
         keep_tag_in_view=not args.no_keep_view,
+        recover_scan_deg=args.recover_scan_deg,
         search_direction=1 if args.search_direction == "ccw" else -1,
     )
 

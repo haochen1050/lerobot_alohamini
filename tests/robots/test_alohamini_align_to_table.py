@@ -571,7 +571,13 @@ def test_tag_still_lost_after_reversing_faults():
     result = run(world)
     assert result.state is AlignState.FAULT
     assert "still not visible after reversing" in result.reason
-    assert len(world.pulses) == 2  # the pulse, then its reversal - nothing more
+    # The pulse, its reversal, then a pure-rotation scan of +-20 deg in 10 deg turns - nothing more.
+    first, back, *scan = world.pulses
+    assert back[:3] == pytest.approx(tuple(-c for c in first[:3]))
+    assert scan and all(vx == 0 and vy == 0 and abs(w) * d <= 10.0 + 1e-6 for vx, vy, w, d in scan)
+    offsets = [e["offset_deg"] for e in result.events if e["event"] == "recover_turn"]
+    assert max(offsets) == pytest.approx(20.0) and min(offsets) == pytest.approx(-20.0)
+    assert abs(sum(w * d for _vx, _vy, w, d in scan)) == pytest.approx(20.0)  # ends on the far side
 
 
 def test_recoveries_are_limited():
@@ -599,3 +605,22 @@ def test_orbit_keeps_the_tag_in_view(theta):
     assert result.ready, result.reason
     assert any(e["event"] == "orbit_pulse" for e in result.events)
     assert world.min_true_margin > 0
+
+
+@pytest.mark.parametrize("slip_deg", [20.0, -20.0])
+def test_scan_finds_the_tag_when_reversing_leaves_the_robot_turned_away(slip_deg):
+    class SlippyReverse(FlakyWorld):
+        def move_base_for(self, *args, **kwargs):
+            result = super().move_base_for(*args, **kwargs)
+            if self.moves == 2:  # the reversal ends turned away from the tag
+                self.yaw += math.radians(slip_deg)
+            return result
+
+    world = SlippyReverse(x=-0.40, y=0.0, yaw_deg=0.0, fov_deg=15.0)
+    world.yaw = math.radians(3.0)  # start slightly turned so the first pulse is a heading correction
+    result = run(world, orbit=False)
+
+    assert result.ready, result.reason
+    found = [e for e in result.events if e["event"] == "recover_found"]
+    assert len(found) == 1
+    assert math.copysign(1, found[0]["offset_deg"]) == -math.copysign(1, slip_deg)  # turned back towards it

@@ -141,20 +141,25 @@ class AlignConfig:
     # 2. Watch: during a pulse the tag is tracked; the pulse ends early when the tag comes within
     #    watch_margin_px of the image border or is missed in watch_misses consecutive frames.
     # 3. Recover: if the tag is lost after a pulse anyway, that pulse is reversed and the axis continues with
-    #    half-length pulses, at most max_recoveries times per run.
+    #    half-length pulses, at most max_recoveries times per run. If the tag is still not visible (reversing
+    #    is not exact), the base turns up to +-recover_scan_deg in recover_scan_step_deg steps to find it,
+    #    starting on the side the tag was last seen.
     keep_tag_in_view: bool = True
     view_margin_px: float = 30.0
     view_overshoot: float = 1.3
     watch_margin_px: float = 10.0
     watch_misses: int = 3
     max_recoveries: int = 3
+    recover_scan_deg: float = 20.0
+    recover_scan_step_deg: float = 10.0
 
     @property
     def max_pulse_s(self) -> float:
-        """Longest pulse this config commands (alignment, search or orbit)."""
+        """Longest pulse this config commands (alignment, search, orbit or recovery scan)."""
         search = self.search_step_deg / self.search_speed_degps if self.search else 0.0
         orbit = self.orbit_max_pulse_s if self.orbit else 0.0
-        return max(self.pulse_s, search, orbit)
+        scan = self.recover_scan_step_deg / self.search_speed_degps if self.keep_tag_in_view else 0.0
+        return max(self.pulse_s, search, orbit, scan)
 
     def __post_init__(self) -> None:
         unknown = set(self.axes) - set(AXES)
@@ -611,9 +616,14 @@ class AlignToTable:
         full_length_only: bool = False,
     ) -> tuple[tuple[float, float, float], float]:
         """``command`` / ``duration``, or a variant of it, whose path keeps the tag view_margin_px inside the
-        image. Raises _ViewBlockedError if none does; unchanged when the view cannot be predicted."""
+        image - or, if the tag is already closer to the edge than that, never brings it closer than it is now.
+        Raises _ViewBlockedError if none does; unchanged when the view cannot be predicted."""
         margin = self._predicted_margin(command, duration)
-        if margin is None or margin >= self.config.view_margin_px:
+        if margin is None:
+            return command, duration
+        now = self.estimator.predict_tag_margin(0.0, 0.0, 0.0)
+        required = min(self.config.view_margin_px, now) - 1e-6
+        if margin >= required:
             return command, duration
         commands = [command]
         if look_at:
@@ -621,7 +631,7 @@ class AlignToTable:
         for fraction in (1.0,) if full_length_only else (1.0, 0.5, 0.25):
             for candidate in commands:
                 m = self._predicted_margin(candidate, fraction * duration)
-                if m is not None and m >= self.config.view_margin_px:
+                if m is not None and m >= required:
                     self._event(
                         "view_plan",
                         original=command,
@@ -679,16 +689,55 @@ class AlignToTable:
         ):
             raise lost
         self._recoveries += 1
+        # Which side the tag was last seen on (+ = left), to scan that way first if reversing is not enough.
+        tag = getattr(self.estimator, "last_fit_T_base_tag", None)
+        side = 1.0 if tag is None or tag[1, 3] >= 0 else -1.0
         command, elapsed = self._last_pulse
         back = (-command[0], -command[1], -command[2])
         self._event("recover", reason=str(lost), command=back, duration_s=elapsed, count=self._recoveries)
         self._move(back, elapsed, watch=False)
         self._add_travel(back, elapsed)
         self._last_pulse = None
+        remeasure = remeasure or self._measure
         try:
-            return (remeasure or self._measure)()
+            return remeasure()
         except _PerceptionLostError as e:
-            raise _FaultError(f"tag still not visible after reversing the last pulse: {e}") from e
+            found = self._scan_for_tag(remeasure, side)
+            if found is None:
+                raise _FaultError(
+                    f"tag still not visible after reversing the last pulse and turning "
+                    f"+-{self.config.recover_scan_deg:g} deg: {e}"
+                ) from e
+            return found
+
+    def _scan_for_tag(self, remeasure: Callable[[], Any], side: float) -> Any:
+        """Turn to +-recover_scan_deg around the current heading in steps, ``side`` first, until ``remeasure``
+        succeeds. Returns its result, or None if the tag was not found."""
+        cfg = self.config
+        step = cfg.recover_scan_step_deg
+        if cfg.recover_scan_deg <= 0 or step <= 0:
+            return None
+        n = max(1, round(cfg.recover_scan_deg / step))
+        offsets = [side * step * k for k in range(1, n + 1)] + [-side * step * k for k in range(1, n + 1)]
+        current = 0.0
+        for offset in offsets:
+            while abs(offset - current) > 1e-9:
+                turn = _clamp(offset - current, step)
+                command = (0.0, 0.0, math.copysign(cfg.search_speed_degps, turn))
+                duration = abs(turn) / cfg.search_speed_degps
+                self._check_travel(command, duration)
+                self._event("recover_turn", offset_deg=current + turn, command=command, duration_s=duration)
+                _stop, elapsed = self._move(command, duration, watch=False)
+                self._add_travel(command, elapsed)
+                current += turn
+            self._last_pulse = None  # a scan turn is not a correction to reverse
+            try:
+                result = remeasure()
+            except _PerceptionLostError:
+                continue
+            self._event("recover_found", offset_deg=current)
+            return result
+        return None
 
     # ------------------------------------------------------------------ travel limits
 
