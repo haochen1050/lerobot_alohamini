@@ -82,6 +82,13 @@ def parse_args():
         help="Do not circle the table to correct a robot standing off to the side of the approach line",
     )
     p.add_argument(
+        "--table-radius",
+        type=float,
+        default=None,
+        help="Round table radius (m): orbit around the table centre and check the distance to the rim "
+        "(default: straight edge, orbit around the approach point)",
+    )
+    p.add_argument(
         "--no-keep-view",
         action="store_true",
         help="Do not plan/watch pulses to keep the tag in the image, or reverse a pulse that lost it",
@@ -115,6 +122,7 @@ def main() -> int:
         orbit=not args.no_orbit,
         keep_tag_in_view=not args.no_keep_view,
         recover_scan_deg=args.recover_scan_deg,
+        table_radius_m=args.table_radius,
         search_direction=1 if args.search_direction == "ccw" else -1,
     )
 

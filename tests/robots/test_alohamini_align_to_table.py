@@ -637,3 +637,51 @@ def test_turned_beyond_heading_limit_in_front_of_the_table_squares_up(turn):
     assert turns and all(e["status"] == "seen" for e in turns)
     assert all(math.copysign(1, e["omega_degps"]) == -math.copysign(1, turn) for e in turns)
     assert not [e for e in result.events if e["event"] == "orbit_pulse"]
+
+
+def around_round_table(theta_deg, centre_dist, table_radius=0.30, **kwargs):
+    """Robot theta_deg around the centre of a round table (table_radius into the table from the approach
+    point), centre_dist from the centre, facing it."""
+    t = math.radians(theta_deg)
+    return OrbitWorld(
+        x=table_radius - centre_dist * math.cos(t),
+        y=-centre_dist * math.sin(t),
+        yaw_deg=theta_deg,
+        **kwargs,
+    )
+
+
+def test_round_table_orbit_circles_the_table_centre():
+    # Like the hardware run: ~48 deg around a 60 cm round table, ~45 cm from the rim. The straight edge through
+    # the approach point is only ~20 cm away there, so the straight-edge orbit refuses.
+    straight = around_round_table(48.0, 0.75, fov_deg=40.0)
+    result = run(straight)
+    assert result.state is AlignState.FAULT
+    assert "too close" in result.reason and "--table-radius" in result.reason
+
+    world = around_round_table(48.0, 0.75, fov_deg=40.0)
+    result = run(world, table_radius_m=0.30)
+    assert result.ready, result.reason
+    assert [e for e in result.events if e["event"] == "orbit_pulse"]
+    err = world.true_error()
+    assert abs(err.distance_error_m) <= 0.02 and abs(err.lateral_error_m) <= 0.02
+
+
+def test_round_table_orbit_keeps_distance_to_the_rim():
+    world = around_round_table(-40.0, 0.70, fov_deg=40.0)
+    distances = []
+    move = world.move_base_for
+
+    def tracked(*args, **kwargs):
+        result = move(*args, **kwargs)
+        distances.append(math.hypot(world.x - 0.30, world.y))
+        return result
+
+    world.move_base_for = tracked
+    result = run(world, table_radius_m=0.30, axes=("heading",))  # orbit, then heading only
+    assert result.ready, result.reason
+    n_orbit = len([e for e in result.events if e["event"] == "orbit_pulse"])
+    assert n_orbit >= 3
+    orbit_distances = distances[:n_orbit]
+    assert max(orbit_distances) - min(orbit_distances) < 0.03
+    assert min(orbit_distances) > 0.30 + 0.25 - 0.03  # never closer to the rim than the minimum

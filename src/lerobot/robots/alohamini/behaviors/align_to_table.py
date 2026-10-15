@@ -123,7 +123,11 @@ class AlignConfig:
     # ORBIT: when the robot stands more than orbit_trigger_deg around the table from the taught approach line
     # (displaced, not just turned), circle the approach point (table frame origin) at constant distance until
     # within orbit_exit_deg; the per-axis stages then finish. Each step must reduce the angle.
+    # For a round table, set table_radius_m: the orbit then circles the table centre (table_radius_m into the
+    # table from the approach point) and orbit_min_distance_m is checked against the real distance to the rim,
+    # instead of a straight edge through the approach point.
     orbit: bool = True
+    table_radius_m: float | None = None
     orbit_trigger_deg: float = 10.0
     orbit_exit_deg: float = 3.0
     orbit_step_deg: float = 10.0
@@ -433,18 +437,30 @@ class AlignToTable:
             rotated += abs(angle)
 
     def _orbit_state(self) -> tuple[float, float, np.ndarray]:
-        """(angle around the approach point minus the taught one [deg], distance to the edge [m], approach
-        point xy in base) from fresh frames, ignoring the heading limit."""
+        """(angle around the orbit centre minus the taught one [deg], distance to the table edge [m], orbit
+        centre xy in base) from fresh frames, ignoring the heading limit. The orbit centre is the approach point,
+        or the table centre for a round table (``table_radius_m``)."""
         target = self.estimator.target
-        taught = math.degrees(math.atan2(target.lateral_m, target.distance_m))
+        radius = self.config.table_radius_m or 0.0
+
+        def around(distance: float, lateral: float) -> float:
+            # Robot reference point in the table frame is (-distance, lateral); the centre is (radius, 0).
+            return math.degrees(math.atan2(lateral, distance + radius))
+
+        taught = around(target.distance_m, target.lateral_m)
         samples: list[tuple[float, float, np.ndarray]] = []
         for looked, _err in enumerate(self._fresh_frames(), start=1):
             raw = getattr(self.estimator, "last_raw_T_base_table", None)
             if raw is not None:
                 m = measure_table_pose(raw, target.reference_x_m, target.reference_y_m)
                 if m is not None:
-                    angle = math.degrees(math.atan2(m.lateral_m, m.distance_m)) - taught
-                    samples.append((angle, m.distance_m, raw[:2, 3].copy()))
+                    angle = around(m.distance_m, m.lateral_m) - taught
+                    if radius:
+                        edge = math.hypot(m.distance_m + radius, m.lateral_m) - radius
+                        centre = (raw @ np.array([radius, 0.0, 0.0, 1.0]))[:2]
+                    else:
+                        edge, centre = m.distance_m, raw[:2, 3].copy()
+                    samples.append((angle, edge, centre))
                     if len(samples) >= self.config.samples_per_measurement:
                         break
             if looked >= 4 * self.config.samples_per_measurement and not samples:
@@ -468,7 +484,11 @@ class AlignToTable:
                     f"{cfg.max_orbit_angle_deg:g}); if the robot is roughly in front, the tag was turned"
                 )
             if distance < cfg.orbit_min_distance_m:
-                raise _FaultError(f"too close to the table to orbit safely ({distance * 100:.0f} cm)")
+                raise _FaultError(
+                    f"too close to the table to orbit safely ({distance * 100:.0f} cm from the "
+                    f"{'rim' if cfg.table_radius_m else 'edge line'}; minimum {cfg.orbit_min_distance_m * 100:.0f} cm)"
+                    + ("" if cfg.table_radius_m else ". For a round table pass its radius (--table-radius)")
+                )
             radius = float(np.hypot(*pivot))
             # Slow down on large radii so the base's linear speed stays bounded, and keep pulses short.
             omega_deg = min(cfg.orbit_speed_degps, math.degrees(cfg.orbit_max_linear_mps / radius))
