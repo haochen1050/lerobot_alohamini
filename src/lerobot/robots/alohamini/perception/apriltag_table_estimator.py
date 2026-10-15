@@ -182,6 +182,13 @@ class AprilTagTableEstimator(TablePoseEstimator):
         # Table pose from the last frame whose tag passed the fit/orientation checks, even if the heading
         # limit then rejected it. Lets the orbit approach work from beyond max_heading_deg.
         self.last_raw_T_base_table: np.ndarray | None = None
+        # Smallest distance (px) from the detected tag's corners to the image border in the last processed
+        # frame; None when the tag was not detected.
+        self.last_tag_margin_px: float | None = None
+        # Tag pose in the base frame from the most recent frame whose tag fitted; kept across frames so a
+        # planned motion can be checked against it (see predict_tag_margin).
+        self.last_fit_T_base_tag: np.ndarray | None = None
+        self._tag_corners = tag_object_points(placement.size_m).astype(np.float64)
 
     def get_table_pose_error(self) -> TablePoseError:
         frame = self.frame_source() if self.frame_source is not None else None
@@ -196,9 +203,36 @@ class AprilTagTableEstimator(TablePoseEstimator):
         ray = self.T_base_cam[:3, :3] @ np.array([x, y, 1.0])
         return math.degrees(math.atan2(ray[1], ray[0]))
 
+    def _margin_px(self, pixels: np.ndarray) -> float:
+        w, h = self.intrinsics.image_size
+        u, v = pixels.reshape(-1, 2).T
+        return float(np.min([u, w - 1 - u, v, h - 1 - v]))
+
+    def predict_tag_margin(self, dx_m: float, dy_m: float, dyaw_deg: float) -> float | None:
+        """Predicted smallest distance (px) from the tag's corners to the image border after the base moves by
+        (dx, dy, dyaw) in its current frame, from the last fitted tag pose. Negative = (partly) out of view,
+        -inf = behind the camera. None if no tag has been fitted yet."""
+        if self.last_fit_T_base_tag is None:
+            return None
+        T_cam_tag = (
+            invert(self.T_base_cam)
+            @ invert(pose_xyz_yaw(dx_m, dy_m, 0.0, dyaw_deg))
+            @ self.last_fit_T_base_tag
+        )
+        pts = (T_cam_tag[:3, :3] @ self._tag_corners.T).T + T_cam_tag[:3, 3]
+        if np.any(pts[:, 2] <= 1e-3):
+            return float("-inf")
+        K = self.intrinsics.camera_matrix
+        pinhole = (K[:2, :2] @ (pts[:, :2] / pts[:, 2:]).T).T + K[:2, 2]
+        distorted, _ = cv2.projectPoints(pts, np.zeros(3), np.zeros(3), K, self.intrinsics.dist_coeffs)
+        # The distortion polynomial can fold points far outside the view back into the image; the pinhole
+        # projection catches those.
+        return min(self._margin_px(pinhole), self._margin_px(distorted))
+
     def estimate(self, image: np.ndarray, capture_time_s: float) -> TablePoseError:
         self.last_tag_bearing_deg = None
         self.last_raw_T_base_table = None
+        self.last_tag_margin_px = None
         age = self.clock() - capture_time_s
         if age > self.max_age_s:
             return TablePoseError.invalid(capture_time_s, f"stale frame ({age:.2f}s old)")
@@ -211,7 +245,9 @@ class AprilTagTableEstimator(TablePoseEstimator):
         detections = self.detector.detect(image)
         wanted = self.placement.tag_id
         matches = [d for d in detections if wanted is None or d[0] == wanted]
-        self.last_tag_bearing_deg = self._bearing_deg(matches[0][1]) if len(matches) == 1 else None
+        if len(matches) == 1:
+            self.last_tag_bearing_deg = self._bearing_deg(matches[0][1])
+            self.last_tag_margin_px = self._margin_px(matches[0][1])
         if len(matches) != 1:
             seen = [d[0] for d in detections]
             expected = "one tag" if wanted is None else f"tag {wanted}"
@@ -235,6 +271,7 @@ class AprilTagTableEstimator(TablePoseEstimator):
             )
 
         self.last_raw_T_base_table = T_base_table
+        self.last_fit_T_base_tag = T_base_tag
         heading = math.degrees(math.atan2(T_base_table[1, 0], T_base_table[0, 0]))
         if abs(heading) > self.max_heading_deg:
             quarter = 90 * round(heading / 90)

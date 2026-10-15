@@ -22,6 +22,7 @@ base is powered.
 """
 
 import contextlib
+import dataclasses
 import logging
 import math
 import signal
@@ -69,6 +70,8 @@ class StopResult:
     errors: dict[str, str] = field(default_factory=dict)
     # Goal_Velocity read back from each wheel (None when the read failed).
     goal_velocity: dict[str, int | None] = field(default_factory=dict)
+    # For a pulse: how long the wheels were commanded to move (shorter than asked if it was cut short).
+    elapsed_s: float | None = None
 
 
 @contextlib.contextmanager
@@ -118,6 +121,7 @@ class BaseController:
         limits: BaseLimits | None = None,
         stop_attempts: int = 3,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if len(wheel_names) != 3:
             raise ValueError(f"Expected 3 wheel names (left, back, right), got {wheel_names!r}")
@@ -131,6 +135,7 @@ class BaseController:
         self.limits = limits or BaseLimits()
         self.stop_attempts = stop_attempts
         self._sleep = sleep
+        self._clock = clock
 
     def set_base_velocity(self, vx: float, vy: float, omega_degps: float) -> dict[str, int]:
         """Clamp and send a body velocity. Returns the per-wheel raw commands that were written.
@@ -213,8 +218,20 @@ class BaseController:
             )
         return result
 
-    def move_base_for(self, vx: float, vy: float, omega_degps: float, duration_s: float) -> StopResult:
+    def move_base_for(
+        self,
+        vx: float,
+        vy: float,
+        omega_degps: float,
+        duration_s: float,
+        *,
+        watch: Callable[[], bool] | None = None,
+        poll_s: float = 0.05,
+    ) -> StopResult:
         """Run a bounded velocity pulse, then stop. The stop runs even on exceptions and Ctrl+C.
+
+        With ``watch``, it is called about every ``poll_s`` while moving; returning False ends the pulse early.
+        ``StopResult.elapsed_s`` is how long the motion was commanded.
 
         Raises:
             ValueError: duration is not in (0, limits.max_pulse_s]. No motion is commanded.
@@ -223,14 +240,23 @@ class BaseController:
         if not (math.isfinite(duration_s) and 0 < duration_s <= self.limits.max_pulse_s):
             raise ValueError(f"Pulse duration {duration_s}s outside (0, {self.limits.max_pulse_s}]s")
 
+        start = self._clock()
+        deadline = start + duration_s
         try:
             self.set_base_velocity(vx, vy, omega_degps)
-            self._sleep(duration_s)
+            if watch is None:
+                self._sleep(duration_s)
+            else:
+                while (remaining := deadline - self._clock()) > 0:
+                    self._sleep(min(poll_s, remaining))
+                    if self._clock() < deadline and not watch():
+                        break
         finally:
+            ended = self._clock()
             result = self.stop_base()
             if not result.confirmed:
                 raise BaseStopError(f"Base stop not confirmed after pulse: {result.errors}")
-        return result
+        return dataclasses.replace(result, elapsed_s=min(ended, deadline) - start)
 
     def __enter__(self) -> "BaseController":
         return self

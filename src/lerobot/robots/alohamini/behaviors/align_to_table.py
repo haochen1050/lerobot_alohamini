@@ -26,6 +26,11 @@ view (turning towards the tag once it is seen) until a valid measurement arrives
 If the robot is then far off the table's approach direction (displaced, not just turned), ORBIT circles the
 approach point at constant distance, facing the table, until the remaining offset is small.
 
+Once the tag has been fitted, the tag is kept in view (``keep_tag_in_view``): each pulse is checked against
+the predicted tag position in the image and shortened, turned to keep looking at the tag, or replaced by a
+correction on another axis if it would bring the tag near the image edge; the tag is tracked during the pulse,
+which ends early if the tag nears the edge; and if the tag is lost after a pulse anyway, the pulse is reversed.
+
 Safety limits here are independent of the gains: total commanded travel and rotation are capped, and the
 robot is never commanded closer to the table than the taught distance minus ``max_approach_overshoot_m``.
 """
@@ -128,6 +133,21 @@ class AlignConfig:
     max_orbit_angle_deg: float = 75.0
     max_orbit_total_deg: float = 90.0
     orbit_max_pulse_s: float = 1.0
+    # Keeping the tag in view once it has been fitted (needs an estimator with predict_tag_margin and
+    # last_tag_margin_px, e.g. AprilTagTableEstimator):
+    # 1. Plan: a pulse is only commanded if the tag's predicted corners stay view_margin_px inside the image
+    #    along the whole path, including view_overshoot x the commanded travel. Otherwise the pulse is
+    #    shortened, a translation also turns to keep looking at the tag, or another axis is corrected first.
+    # 2. Watch: during a pulse the tag is tracked; the pulse ends early when the tag comes within
+    #    watch_margin_px of the image border or is missed in watch_misses consecutive frames.
+    # 3. Recover: if the tag is lost after a pulse anyway, that pulse is reversed and the axis continues with
+    #    half-length pulses, at most max_recoveries times per run.
+    keep_tag_in_view: bool = True
+    view_margin_px: float = 30.0
+    view_overshoot: float = 1.3
+    watch_margin_px: float = 10.0
+    watch_misses: int = 3
+    max_recoveries: int = 3
 
     @property
     def max_pulse_s(self) -> float:
@@ -164,8 +184,31 @@ class _FaultError(Exception):
     pass
 
 
+class _PerceptionLostError(_FaultError):
+    pass
+
+
+class _ViewBlockedError(Exception):
+    """No variant of a planned pulse keeps the tag in view."""
+
+
 def _clamp(value: float, limit: float) -> float:
     return max(-limit, min(limit, value))
+
+
+def _wrap_deg(angle: float) -> float:
+    return (angle + 180.0) % 360.0 - 180.0
+
+
+def body_displacement(vx: float, vy: float, omega_degps: float, t: float) -> tuple[float, float, float]:
+    """(dx, dy, dyaw_deg) of the base after a constant body twist for t seconds, in its starting frame."""
+    w = math.radians(omega_degps)
+    phi = w * t
+    if abs(phi) < 1e-9:
+        return vx * t, vy * t, 0.0
+    dx = (vx * math.sin(phi) + vy * (math.cos(phi) - 1.0)) / w
+    dy = (vx * (1.0 - math.cos(phi)) + vy * math.sin(phi)) / w
+    return dx, dy, math.degrees(phi)
 
 
 class AlignToTable:
@@ -195,6 +238,11 @@ class AlignToTable:
         self._travel = {"x": 0.0, "y": 0.0, "theta": 0.0}
         # Frames captured before this time may show the robot moving.
         self._motion_end = self._clock()
+        # Keeping the tag in view: recoveries used, per-axis pulse scale (halved after each recovery), and the
+        # last pulse actually executed (command, seconds) so it can be reversed.
+        self._recoveries = 0
+        self._scale = dict.fromkeys((*AXES, "orbit"), 1.0)
+        self._last_pulse: tuple[tuple[float, float, float], float] | None = None
         verified = 0
         state = AlignState.ESTIMATE
         self._event("start", config=asdict(cfg))
@@ -227,7 +275,7 @@ class AlignToTable:
                         raise _FaultError(f"no convergence after {cfg.max_steps} steps")
                     result.steps += 1
                     # The post-step measurement is the next observation.
-                    err = self._step(self._axis_of(state), err)
+                    err = self._step_keeping_view(self._axis_of(state), err)
                     continue
 
                 new_state = _ALIGN_STATE[out[0]] if out else AlignState.VERIFY
@@ -290,7 +338,7 @@ class AlignToTable:
         self._last_reason, last_ts = "no frame", None
         while True:
             if self._clock() > deadline:
-                raise _FaultError(f"perception lost: {self._last_reason}")
+                raise _PerceptionLostError(f"perception lost: {self._last_reason}")
             err = self.estimator.get_table_pose_error()
             if err.timestamp_s < not_before or err.timestamp_s == last_ts:
                 self._last_reason = "no fresh frame since last motion"
@@ -392,7 +440,7 @@ class AlignToTable:
                     if len(samples) >= self.config.samples_per_measurement:
                         break
             if looked >= 4 * self.config.samples_per_measurement and not samples:
-                raise _FaultError(f"perception lost during orbit: {self._last_reason}")
+                raise _PerceptionLostError(f"perception lost during orbit: {self._last_reason}")
         samples.sort(key=lambda sample: sample[0])
         return samples[len(samples) // 2]
 
@@ -416,7 +464,7 @@ class AlignToTable:
             radius = float(np.hypot(*pivot))
             # Slow down on large radii so the base's linear speed stays bounded, and keep pulses short.
             omega_deg = min(cfg.orbit_speed_degps, math.degrees(cfg.orbit_max_linear_mps / radius))
-            step = min(cfg.orbit_step_deg, omega_deg * cfg.orbit_max_pulse_s)
+            step = min(cfg.orbit_step_deg, omega_deg * cfg.orbit_max_pulse_s) * self._scale["orbit"]
             # Orbiting by +a (CCW) about the approach point decreases the angle error by a.
             orbit = max(-step, min(step, angle_err))
             if orbited + abs(orbit) > cfg.max_orbit_total_deg:
@@ -425,20 +473,29 @@ class AlignToTable:
             omega = math.radians(omega_deg)
             # Body twist whose instantaneous centre of rotation is the approach point (x0, y0):
             # ICR = (-vy / w, vx / w)  =>  vx = y0 * w, vy = -x0 * w.
-            vx, vy = pivot[1] * omega, -pivot[0] * omega
-            duration = abs(orbit) / abs(omega_deg)
+            command = (pivot[1] * omega, -pivot[0] * omega, omega_deg)
+            try:
+                command, duration = self._plan_in_view(command, abs(orbit) / abs(omega_deg), look_at=False)
+            except _ViewBlockedError as e:
+                raise _FaultError(f"orbit would take the tag out of view: {e}") from e
             self._event(
                 "orbit_pulse",
                 angle_error_deg=angle_err,
                 radius_m=radius,
-                command=(vx, vy, omega_deg),
+                command=command,
                 duration_s=duration,
             )
-            self.base.move_base_for(vx, vy, omega_deg, duration)
-            self._motion_end = self._clock()
+            _stop, elapsed = self._move(command, duration)
+            orbit = omega_deg * elapsed
             orbited += abs(orbit)
 
-            new_err, distance, pivot = self._orbit_state()
+            try:
+                new_err, distance, pivot = self._orbit_state()
+            except _PerceptionLostError as lost:
+                angle_err, distance, pivot = self._recover(lost, self._orbit_state)
+                orbited -= abs(orbit)
+                self._scale["orbit"] *= 0.5
+                continue
             if abs(new_err) > abs(angle_err) - 0.3 * abs(orbit):
                 raise _FaultError(
                     f"orbit did not reduce the angle ({angle_err:+.1f} -> {new_err:+.1f} deg after a "
@@ -447,45 +504,70 @@ class AlignToTable:
             angle_err = new_err
         self._event("orbit_done", orbited_deg=orbited, angle_error_deg=angle_err)
 
-    def _step(self, axis: str, err: TablePoseError) -> TablePoseError:
+    def _step_keeping_view(self, axis: str, err: TablePoseError) -> TablePoseError:
+        """One correction of ``axis``; if no pulse of it keeps the tag in view, correct another axis that needs
+        it instead (the current axis is retried on the next iteration). Full-length pulses on any axis are
+        preferred over shortened ones, which make little progress and may not overcome wheel friction."""
+        others = [a for a in AXES if a != axis and a in self.config.axes and self._needs_correction(a, err)]
+        blocked = []
+        for full_length_only in (True, False):
+            for candidate in (axis, *others):
+                try:
+                    new_err = self._step(candidate, err, full_length_only=full_length_only)
+                except _ViewBlockedError as e:
+                    if not full_length_only:
+                        blocked.append(f"{candidate}: {e}")
+                        self._event("view_blocked", axis=candidate, reason=str(e))
+                    continue
+                if candidate != axis:
+                    self._event("view_switch", axis=axis, corrected=candidate, full_length=full_length_only)
+                return new_err
+        raise _FaultError(
+            "every correction would take the tag out of view (" + "; ".join(blocked) + "). Re-teach with the "
+            "tag nearer the image centre, or start closer to the target"
+        )
+
+    def _step(self, axis: str, err: TablePoseError, *, full_length_only: bool = False) -> TablePoseError:
         cfg, ax = self.config, self.config.axis(axis)
         error = getattr(err, ERROR_FIELD[axis])
         speed = _clamp(ax.gain * error, ax.max_speed)
         if abs(speed) < ax.min_speed:
             speed = math.copysign(ax.min_speed, error)
-        displacement = speed * cfg.pulse_s
+        duration = cfg.pulse_s * self._scale[axis]
 
-        if axis == "distance" and displacement > 0:
+        if axis == "distance" and speed > 0:
             # Hard approach limit: forward travel may not overshoot the taught distance by more than the margin.
             allowed = err.distance_error_m + cfg.max_approach_overshoot_m
             if allowed <= 0:
                 raise _FaultError(
                     f"approach limit: already {-err.distance_error_m * 100:.1f} cm inside the target"
                 )
-            displacement = min(displacement, allowed)
-            speed = displacement / cfg.pulse_s
-
-        key = {"distance": "x", "lateral": "y", "heading": "theta"}[axis]
-        self._travel[key] += displacement
-        translation = math.hypot(self._travel["x"], self._travel["y"])
-        if (
-            translation > cfg.max_total_translation_m
-            or abs(self._travel["theta"]) > cfg.max_total_rotation_deg
-        ):
-            raise _FaultError(f"workspace limit: commanded travel {self._travel}")
+            speed = min(speed * duration, allowed) / duration
 
         command = {
             "distance": (speed, 0.0, 0.0),
             "lateral": (0.0, speed, 0.0),
             "heading": (0.0, 0.0, speed),
         }[axis]
-        self._event("pulse", axis=axis, error=error, command=command, duration_s=cfg.pulse_s)
-        stop = self.base.move_base_for(*command, cfg.pulse_s)
-        self._motion_end = self._clock()
-        self._event("stopped", confirmed=stop.confirmed, goal_velocity=stop.goal_velocity)
+        command, duration = self._plan_in_view(
+            command, duration, look_at=axis != "heading", full_length_only=full_length_only
+        )
+        # Workspace limits on what may be commanded, before moving.
+        self._check_travel(command, duration)
 
-        new_err = self._measure()
+        self._event("pulse", axis=axis, error=error, command=command, duration_s=duration)
+        stop, elapsed = self._move(command, duration)
+        self._add_travel(command, elapsed)
+        self._event("stopped", confirmed=stop.confirmed, goal_velocity=stop.goal_velocity, elapsed_s=elapsed)
+
+        try:
+            new_err = self._measure()
+        except _PerceptionLostError as lost:
+            new_err = self._recover(lost)
+            self._scale[axis] *= 0.5
+            return new_err
         after = getattr(new_err, ERROR_FIELD[axis])
+        displacement = {"distance": command[0], "lateral": command[1], "heading": command[2]}[axis] * elapsed
         # A correct step shrinks the error; growth beyond noise means the sign or calibration is wrong.
         if abs(after) > abs(error) + max(ax.noise, 0.5 * abs(displacement)):
             raise _FaultError(
@@ -493,6 +575,137 @@ class AlignToTable:
                 "(wrong sign or slipping?)"
             )
         return new_err
+
+    # ------------------------------------------------------------------ keeping the tag in view
+
+    def _keeps_view(self) -> bool:
+        return self.config.keep_tag_in_view and hasattr(self.estimator, "predict_tag_margin")
+
+    def _predicted_margin(self, command: tuple[float, float, float], duration: float) -> float | None:
+        """Worst predicted tag margin (px) along the pulse's path, or None if it cannot be predicted."""
+        if not self._keeps_view():
+            return None
+        margins = []
+        for fraction in (0.25, 0.5, 0.75, 1.0, self.config.view_overshoot):
+            margin = self.estimator.predict_tag_margin(*body_displacement(*command, fraction * duration))
+            if margin is None:
+                return None
+            margins.append(margin)
+        return min(margins)
+
+    def _look_at(self, command: tuple[float, float, float], duration: float) -> tuple[float, float, float]:
+        """The translation ``command`` plus the rotation that keeps the tag at the same bearing."""
+        vx, vy, _ = command
+        tag_x, tag_y = self.estimator.last_fit_T_base_tag[:2, 3]
+        before = math.degrees(math.atan2(tag_y, tag_x))
+        after = math.degrees(math.atan2(tag_y - vy * duration, tag_x - vx * duration))
+        omega = _clamp(_wrap_deg(after - before) / duration, self.config.heading.max_speed)
+        return vx, vy, omega
+
+    def _plan_in_view(
+        self,
+        command: tuple[float, float, float],
+        duration: float,
+        *,
+        look_at: bool,
+        full_length_only: bool = False,
+    ) -> tuple[tuple[float, float, float], float]:
+        """``command`` / ``duration``, or a variant of it, whose path keeps the tag view_margin_px inside the
+        image. Raises _ViewBlockedError if none does; unchanged when the view cannot be predicted."""
+        margin = self._predicted_margin(command, duration)
+        if margin is None or margin >= self.config.view_margin_px:
+            return command, duration
+        commands = [command]
+        if look_at:
+            commands.append(self._look_at(command, duration))
+        for fraction in (1.0,) if full_length_only else (1.0, 0.5, 0.25):
+            for candidate in commands:
+                m = self._predicted_margin(candidate, fraction * duration)
+                if m is not None and m >= self.config.view_margin_px:
+                    self._event(
+                        "view_plan",
+                        original=command,
+                        command=candidate,
+                        duration_s=fraction * duration,
+                        margin_px=m,
+                        original_margin_px=margin,
+                    )
+                    return candidate, fraction * duration
+        raise _ViewBlockedError(f"tag would come within {margin:.0f}px of the image edge")
+
+    def _watch(self) -> Callable[[], bool]:
+        """Mid-pulse check: False (end the pulse now) when the tag nears the border or keeps going missing."""
+        cfg = self.config
+        state = {"misses": 0, "last_ts": None}
+
+        def watch() -> bool:
+            err = self.estimator.get_table_pose_error()
+            if err.timestamp_s == state["last_ts"]:
+                return True
+            state["last_ts"] = err.timestamp_s
+            margin = getattr(self.estimator, "last_tag_margin_px", None)
+            if margin is None:
+                state["misses"] += 1
+                if state["misses"] >= cfg.watch_misses:
+                    self._event("watch_stop", reason=f"tag missed in {state['misses']} frames: {err.reason}")
+                    return False
+                return True
+            state["misses"] = 0
+            if margin < cfg.watch_margin_px:
+                self._event("watch_stop", reason=f"tag {margin:.0f}px from the image edge")
+                return False
+            return True
+
+        return watch
+
+    def _move(self, command: tuple[float, float, float], duration: float, *, watch: bool = True):
+        """One pulse (tracking the tag while moving when enabled). Returns (StopResult, seconds moved)."""
+        if watch and self._keeps_view() and hasattr(self.estimator, "last_tag_margin_px"):
+            stop = self.base.move_base_for(*command, duration, watch=self._watch())
+        else:
+            stop = self.base.move_base_for(*command, duration)
+        self._motion_end = self._clock()
+        elapsed = duration if stop.elapsed_s is None else stop.elapsed_s
+        self._last_pulse = (command, elapsed)
+        return stop, elapsed
+
+    def _recover(self, lost: _PerceptionLostError, remeasure: Callable[[], Any] | None = None) -> Any:
+        """Reverse the last pulse (the tag was in view before it) and measure again with ``remeasure``
+        (default: _measure)."""
+        if (
+            not self._keeps_view()
+            or self._last_pulse is None
+            or self._recoveries >= self.config.max_recoveries
+        ):
+            raise lost
+        self._recoveries += 1
+        command, elapsed = self._last_pulse
+        back = (-command[0], -command[1], -command[2])
+        self._event("recover", reason=str(lost), command=back, duration_s=elapsed, count=self._recoveries)
+        self._move(back, elapsed, watch=False)
+        self._add_travel(back, elapsed)
+        self._last_pulse = None
+        try:
+            return (remeasure or self._measure)()
+        except _PerceptionLostError as e:
+            raise _FaultError(f"tag still not visible after reversing the last pulse: {e}") from e
+
+    # ------------------------------------------------------------------ travel limits
+
+    def _check_travel(self, command: tuple[float, float, float], duration: float) -> None:
+        cfg = self.config
+        x = self._travel["x"] + command[0] * duration
+        y = self._travel["y"] + command[1] * duration
+        theta = self._travel["theta"] + command[2] * duration
+        if math.hypot(x, y) > cfg.max_total_translation_m or abs(theta) > cfg.max_total_rotation_deg:
+            raise _FaultError(
+                f"workspace limit: commanded travel would reach x={x:.3f} y={y:.3f} theta={theta:.1f}"
+            )
+
+    def _add_travel(self, command: tuple[float, float, float], seconds: float) -> None:
+        self._travel["x"] += command[0] * seconds
+        self._travel["y"] += command[1] * seconds
+        self._travel["theta"] += command[2] * seconds
 
     def _event(self, kind: str, **data: Any) -> None:
         event = {"t": self._clock(), "event": kind, **data}

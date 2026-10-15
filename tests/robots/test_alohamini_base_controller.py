@@ -237,3 +237,48 @@ def test_open_wheel_bus_rejects_wrong_device(monkeypatch, answering, power_hint)
         open_wheel_bus("/dev/null", "sts3250")
     assert ("base motor power" in str(excinfo.value)) == power_hint
     assert disconnected == [False]
+
+
+def test_watched_pulse_ends_early_and_reports_elapsed():
+    bus = FakeWheelBus()
+    now = [0.0]
+
+    def sleep(s):
+        assert bus.goal[LEFT] != 0, "base should be moving mid-pulse"
+        now[0] += s
+
+    calls = []
+
+    def watch():
+        calls.append(now[0])
+        return now[0] < 0.12  # tag nears the edge after ~0.12 s
+
+    ctrl = make_controller(bus, sleep=sleep, clock=lambda: now[0])
+    result = ctrl.move_base_for(0.05, 0, 0, 0.3, watch=watch, poll_s=0.05)
+
+    assert result.confirmed
+    assert bus.goal == dict.fromkeys(WHEEL_NAMES, 0)
+    assert result.elapsed_s == pytest.approx(0.15)
+    assert len(calls) == 3
+
+
+def test_watched_pulse_runs_full_length_when_watch_is_happy():
+    bus = FakeWheelBus()
+    now = [0.0]
+    ctrl = make_controller(bus, sleep=lambda s: now.__setitem__(0, now[0] + s), clock=lambda: now[0])
+    result = ctrl.move_base_for(0.05, 0, 0, 0.3, watch=lambda: True, poll_s=0.05)
+    assert result.elapsed_s == pytest.approx(0.3)
+    assert bus.goal == dict.fromkeys(WHEEL_NAMES, 0)
+
+
+def test_watch_exception_still_stops():
+    bus = FakeWheelBus()
+    now = [0.0]
+
+    def watch():
+        raise RuntimeError("camera died")
+
+    ctrl = make_controller(bus, sleep=lambda s: now.__setitem__(0, now[0] + s), clock=lambda: now[0])
+    with pytest.raises(RuntimeError):
+        ctrl.move_base_for(0.05, 0, 0, 0.3, watch=watch)
+    assert bus.goal == dict.fromkeys(WHEEL_NAMES, 0)

@@ -19,6 +19,10 @@ If the tag is not usable at the start, the robot first rotates in place to find 
 if it stands off to the side of the table's approach line it circles the approach point at constant distance
 until it is roughly in front (--no-search / --no-orbit disable these).
 
+Once the tag has been seen, every pulse is planned so the tag stays inside the image (shortened, turned to keep
+looking at the tag, or another axis corrected first), the tag is tracked during the pulse and the pulse ends
+early if it nears the image edge, and if it is lost anyway the pulse is reversed (--no-keep-view disables this).
+
 A JSONL log of every measurement, pulse, stop and state transition is written per trial.
 """
 
@@ -77,6 +81,11 @@ def parse_args():
         help="Do not circle the table to correct a robot standing off to the side of the approach line",
     )
     p.add_argument(
+        "--no-keep-view",
+        action="store_true",
+        help="Do not plan/watch pulses to keep the tag in the image, or reverse a pulse that lost it",
+    )
+    p.add_argument(
         "--search-direction",
         choices=("ccw", "cw"),
         default="ccw",
@@ -97,6 +106,7 @@ def main() -> int:
         timeout_s=args.timeout_s,
         search=not args.no_search,
         orbit=not args.no_orbit,
+        keep_tag_in_view=not args.no_keep_view,
         search_direction=1 if args.search_direction == "ccw" else -1,
     )
 

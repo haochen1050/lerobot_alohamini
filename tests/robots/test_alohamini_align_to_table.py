@@ -29,7 +29,7 @@ class SimWorld:
         self.calls = 0
 
     # -- base
-    def move_base_for(self, vx, vy, omega_degps, duration_s):
+    def move_base_for(self, vx, vy, omega_degps, duration_s, *, watch=None, poll_s=0.05):
         self.pulses.append((vx, vy, omega_degps, duration_s))
         vx, vy, w = (
             s * self.efficiency * v
@@ -37,12 +37,23 @@ class SimWorld:
         )
         n = 20
         dt = duration_s / n
+        elapsed, next_watch = 0.0, poll_s
         for _ in range(n):
             self.yaw += w * dt
             self.x += (vx * math.cos(self.yaw) - vy * math.sin(self.yaw)) * dt
             self.y += (vx * math.sin(self.yaw) + vy * math.cos(self.yaw)) * dt
-        self.t += duration_s
-        return self.stop_base()
+            self.t += dt
+            elapsed += dt
+            self.on_substep()
+            if watch is not None and elapsed >= next_watch - 1e-9 and elapsed < duration_s - 1e-9:
+                next_watch += poll_s
+                if not watch():
+                    break
+        stop = self.stop_base()
+        return StopResult(stop.confirmed, stop.attempts, stop.errors, elapsed_s=elapsed)
+
+    def on_substep(self):
+        pass
 
     def stop_base(self):
         self.stops += 1
@@ -429,3 +440,162 @@ def test_merely_rotated_robot_is_not_orbited():
     result = run(world)
     assert result.ready, result.reason
     assert not [e for e in result.events if e["event"] == "orbit_pulse"]
+
+
+# ---------------------------------------------------------------- keeping the tag in view
+
+
+class ViewWorld(OrbitWorld):
+    """OrbitWorld with an image: the tag's margin to the image border (px) shrinks linearly with its bearing,
+    reaching 0 at the edge of the field of view. Tracks the smallest true margin seen during motion."""
+
+    px_per_deg = 10.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.last_tag_margin_px = None
+        self.last_fit_T_base_tag = None
+        self.min_true_margin = math.inf
+        self.lost_until_moved = False
+
+    def _margin(self, tag_x, tag_y):
+        if tag_x <= 0:
+            return -math.inf
+        return (self.fov_deg - abs(math.degrees(math.atan2(tag_y, tag_x)))) * self.px_per_deg
+
+    def true_margin(self):
+        tag = invert(pose_xyz_yaw(self.x, self.y, 0, math.degrees(self.yaw)))
+        return self._margin(tag[0, 3], tag[1, 3])
+
+    def on_substep(self):
+        self.min_true_margin = min(self.min_true_margin, self.true_margin())
+
+    def get_table_pose_error(self):
+        if self.lost_until_moved:
+            self.calls += 1
+            self.t += 0.033
+            self.last_tag_bearing_deg = self.last_raw_T_base_table = self.last_tag_margin_px = None
+            return TablePoseError.invalid(self.t, "expected one tag, saw []")
+        err = super().get_table_pose_error()
+        if self.last_tag_bearing_deg is None:
+            self.last_tag_margin_px = None
+        else:
+            self.last_fit_T_base_tag = self.last_raw_T_base_table  # the tag is at the table origin
+            self.last_tag_margin_px = self.true_margin()
+        return err
+
+    def predict_tag_margin(self, dx, dy, dyaw_deg):
+        if self.last_fit_T_base_tag is None:
+            return None
+        tag = invert(pose_xyz_yaw(dx, dy, 0, dyaw_deg)) @ self.last_fit_T_base_tag
+        return self._margin(tag[0, 3], tag[1, 3])
+
+
+def facing_tag(x, y, **kwargs):
+    """Robot at (x, y) in the table frame, turned to look straight at the tag."""
+    return ViewWorld(x=x, y=y, yaw_deg=math.degrees(math.atan2(-y, -x)), **kwargs)
+
+
+def test_tag_stays_in_view_when_aligning_heading_would_lose_it():
+    # 15 cm to the side and looking at the tag: turning square to the table first would put the tag ~23 deg
+    # off-centre, outside the +-20 deg view. The plan must keep it in view the whole time.
+    world = facing_tag(-0.36, 0.15, fov_deg=20.0)
+    result = run(world, orbit=False)  # orbit alone would fix this start; test the per-axis stages
+
+    assert result.ready, result.reason
+    assert world.min_true_margin > 0, "tag left the image during a pulse"
+    err = world.true_error()
+    assert abs(err.lateral_error_m) <= 0.02 and abs(err.heading_error_deg) <= 2.0
+    kinds = {e["event"] for e in result.events}
+    assert "view_switch" in kinds  # corrected another axis while turning square would lose the tag
+    assert "recover" not in kinds
+
+
+def test_without_view_keeping_the_same_start_loses_the_tag():
+    world = facing_tag(-0.36, 0.15, fov_deg=20.0)
+    result = run(world, keep_tag_in_view=False, orbit=False)
+    assert result.state is AlignState.FAULT
+    assert "perception lost" in result.reason
+    assert world.min_true_margin < 0
+
+
+def test_watch_ends_a_pulse_before_the_tag_leaves_the_image():
+    # Planning disabled (any margin accepted), so only the mid-pulse watch protects the view.
+    world = facing_tag(-0.36, 0.15, fov_deg=20.0)
+    result = run(world, view_margin_px=-1e9, max_steps=6, orbit=False)
+
+    stops = [e for e in result.events if e["event"] == "watch_stop"]
+    assert stops and "image edge" in stops[0]["reason"]
+    assert world.min_true_margin > 0
+    cut = [e for e in result.events if e["event"] == "stopped" and e["elapsed_s"] < 0.3 - 1e-6]
+    assert cut, "a pulse should have been cut short"
+
+
+class FlakyWorld(ViewWorld):
+    """The tag cannot be detected after the n-th move until the base moves again (or ever, if sticky)."""
+
+    def __init__(self, *args, lose_after_move=1, sticky=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.lose_after_move = lose_after_move
+        self.sticky = sticky
+        self.moves = 0
+
+    def move_base_for(self, *args, **kwargs):
+        if not self.sticky:
+            self.lost_until_moved = False
+        result = super().move_base_for(*args, **kwargs)
+        self.moves += 1
+        if self.moves == self.lose_after_move:
+            self.lost_until_moved = True
+        return result
+
+
+def test_tag_lost_after_a_pulse_is_recovered_by_reversing_it():
+    world = FlakyWorld(x=-0.40, y=0.03, yaw_deg=6.0, fov_deg=40.0)
+    result = run(world)
+
+    assert result.ready, result.reason
+    recover = [e for e in result.events if e["event"] == "recover"]
+    assert len(recover) == 1
+    first, back = world.pulses[0], world.pulses[1]
+    assert back[:3] == pytest.approx(tuple(-c for c in first[:3]))
+    assert back[3] == pytest.approx(first[3])
+    # The same axis continues with half-length pulses.
+    heading = [e for e in result.events if e["event"] == "pulse" and e["axis"] == "heading"]
+    assert heading[0]["duration_s"] == pytest.approx(0.3)
+    assert heading[1]["duration_s"] == pytest.approx(0.15)
+
+
+def test_tag_still_lost_after_reversing_faults():
+    world = FlakyWorld(x=-0.40, y=0.03, yaw_deg=6.0, fov_deg=40.0, sticky=True)
+    result = run(world)
+    assert result.state is AlignState.FAULT
+    assert "still not visible after reversing" in result.reason
+    assert len(world.pulses) == 2  # the pulse, then its reversal - nothing more
+
+
+def test_recoveries_are_limited():
+    class AlwaysFlaky(ViewWorld):
+        def move_base_for(self, *args, **kwargs):
+            self.lost_until_moved = False
+            result = super().move_base_for(*args, **kwargs)
+            # Lose the tag after every forward pulse, never after a reversal.
+            self.lost_until_moved = not getattr(self, "_reversing", False)
+            self._reversing = not getattr(self, "_reversing", False) and self.lost_until_moved
+            return result
+
+    world = AlwaysFlaky(x=-0.40, y=0.03, yaw_deg=6.0, fov_deg=40.0)
+    result = run(world, max_recoveries=2)
+    assert result.state is AlignState.FAULT
+    assert "perception lost" in result.reason
+    assert len([e for e in result.events if e["event"] == "recover"]) == 2
+
+
+@pytest.mark.parametrize("theta", [-30.0, 25.0])
+def test_orbit_keeps_the_tag_in_view(theta):
+    t = math.radians(theta)
+    world = ViewWorld(x=-0.6 * math.cos(t), y=-0.6 * math.sin(t), yaw_deg=theta, fov_deg=31.0)
+    result = run(world)
+    assert result.ready, result.reason
+    assert any(e["event"] == "orbit_pulse" for e in result.events)
+    assert world.min_true_margin > 0

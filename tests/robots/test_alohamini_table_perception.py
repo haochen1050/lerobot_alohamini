@@ -374,3 +374,31 @@ def test_intrinsics_round_trip(tmp_path):
     loaded = CameraIntrinsics.load(path)
     assert loaded.camera_matrix == pytest.approx(K)
     assert loaded.image_size == (W, H)
+
+
+@pytest.mark.parametrize("motion", [(0.0, 0.0, 0.0), (0.0, 0.0, 12.0), (0.0, 0.05, -8.0), (0.08, -0.04, 0.0)])
+def test_predicted_tag_margin_matches_the_view_after_moving(motion):
+    placement = TagPlacement(x_m=0.12, tag_id=3)
+    T_base_tag = pose_xyz_yaw(0.70, 0.05, 0.75, 4.0) @ placement.T_table_tag()
+    est = AprilTagTableEstimator(INTRINSICS, T_BASE_CAM, placement, TableTarget(), clock=lambda: 0.0)
+    assert est.predict_tag_margin(*motion) is None  # nothing fitted yet
+    assert est.estimate(render_tag(T_base_tag), 0.0).valid
+
+    predicted = est.predict_tag_margin(*motion)
+    moved = AprilTagTableEstimator(INTRINSICS, T_BASE_CAM, placement, TableTarget(), clock=lambda: 0.0)
+    moved.estimate(render_tag(invert(pose_xyz_yaw(motion[0], motion[1], 0.0, motion[2])) @ T_base_tag), 0.0)
+    assert moved.last_tag_margin_px is not None
+    assert predicted == pytest.approx(moved.last_tag_margin_px, abs=3.0)
+
+
+def test_predicted_tag_margin_out_of_view_and_behind():
+    placement = TagPlacement(x_m=0.12, tag_id=3)
+    est = AprilTagTableEstimator(INTRINSICS, T_BASE_CAM, placement, TableTarget(), clock=lambda: 0.0)
+    assert est.estimate(render_tag(pose_xyz_yaw(0.70, 0.0, 0.75, 0.0) @ placement.T_table_tag()), 0.0).valid
+    assert est.predict_tag_margin(0.0, 0.0, 0.0) > 50
+    assert est.predict_tag_margin(0.0, 0.0, 60.0) < 0  # turned away: off the side of the image
+    assert est.predict_tag_margin(0.0, 0.0, 180.0) == float("-inf")  # behind the camera
+    # Margins are kept after a frame without the tag, so a plan can still be checked.
+    est.estimate(np.full((H, W, 3), 90, np.uint8), 0.0)
+    assert est.last_tag_margin_px is None
+    assert est.predict_tag_margin(0.0, 0.0, 0.0) > 50

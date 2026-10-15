@@ -38,6 +38,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from lerobot.robots.alohamini.behaviors import AlignConfig
 from lerobot.robots.alohamini.perception import (
     TAG_MOUNTS,
     AprilTagDetector,
@@ -57,6 +58,8 @@ from lerobot.robots.alohamini.perception import (
 from lerobot.robots.alohamini.perception.geometry import average_transforms, pose_xyz_yaw
 
 OUT = Path("outputs/table_alignment")
+# Warn at teach time when the tag sits this close to the image edge at the target pose.
+MIN_TEACH_MARGIN_PX = 60
 DEFAULTS = {
     "camera": "/dev/am_camera_forward",
     "charuco_dir": OUT / "charuco_forward",
@@ -380,7 +383,8 @@ def cmd_watch(args) -> None:
                 print(
                     f"dist_err {err.distance_error_m * 100:+6.1f} cm  lat_err {err.lateral_error_m * 100:+6.1f} cm  "
                     f"head_err {err.heading_error_deg:+6.1f} deg   | measured dist {m.distance_m * 100:5.1f} cm "
-                    f"lat {m.lateral_m * 100:+5.1f} cm head {m.heading_deg:+5.1f} deg"
+                    f"lat {m.lateral_m * 100:+5.1f} cm head {m.heading_deg:+5.1f} deg | "
+                    f"edge margin {estimator.last_tag_margin_px:4.0f} px"
                 )
             else:
                 print(f"INVALID: {err.reason}")
@@ -396,6 +400,7 @@ def cmd_teach(args) -> None:
     cam = LatestFrame(args.camera, *intr.image_size)
     estimator = make_estimator(args, cam, TableTarget(reference_x_m=args.reference_x))
     samples: list[TableMeasurement] = []
+    margins: list[float] = []
     rejected: Counter[str] = Counter()
     try:
         cam.wait_first()
@@ -410,6 +415,7 @@ def cmd_teach(args) -> None:
             err = estimator.estimate(*frame)
             if err.valid:
                 samples.append(measure_table_pose(estimator.last_T_base_table, args.reference_x))
+                margins.append(estimator.last_tag_margin_px)
             else:
                 rejected[err.reason] += 1
     finally:
@@ -427,6 +433,14 @@ def cmd_teach(args) -> None:
         f"lat {mean[1] * 100:+.1f} cm (+-{std[1] * 100:.2f}), head {mean[2]:+.2f} deg (+-{std[2]:.2f})"
     )
     print(f"Saved {args.target}")
+    margin = float(np.median(margins))
+    print(f"Tag corners are {margin:.0f} px from the image edge at the target pose.")
+    if margin < MIN_TEACH_MARGIN_PX:
+        print(
+            f"WARNING: less than {MIN_TEACH_MARGIN_PX} px. Alignment keeps the tag at least "
+            f"{AlignConfig.view_margin_px:g} px inside the image, so corrections near the target may be blocked. "
+            "Move the tag towards the image centre (or re-aim the camera) and re-teach."
+        )
 
 
 def cmd_snapshot(args) -> None:
