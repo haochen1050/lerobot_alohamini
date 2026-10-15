@@ -22,7 +22,8 @@ what a wrong sign looks like). Only the axes in ``AlignConfig.axes`` are correct
 stages can be brought up one at a time.
 
 If the tag is not usable at the start, SEARCH rotates in place in steps smaller than the camera's field of
-view (turning towards the tag once it is seen) until a valid measurement arrives, or faults after one turn.
+view (turning towards the tag once it is seen, which also squares up a robot turned beyond the heading limit)
+until a valid measurement arrives, or faults after one turn.
 If the robot is then far off the table's approach direction (displaced, not just turned), ORBIT circles the
 approach point at constant distance, facing the table, until the remaining offset is small.
 
@@ -405,15 +406,17 @@ class AlignToTable:
                 self._event("search_done", rotated_deg=rotated, bearing_deg=bearing)
                 return
             if status == "seen":
-                if cfg.orbit and self._raw_seen:
-                    # Tag fitted fine but the robot is off to the side: the orbit approach takes over.
-                    self._event("search_done", rotated_deg=rotated, bearing_deg=bearing, needs_orbit=True)
-                    return
                 if abs(bearing) <= cfg.search_center_deg:
+                    if self._raw_seen and cfg.orbit:
+                        # Facing the tag, which fitted fine, yet the table heading is beyond the limit: the
+                        # robot stands off to the side of the approach line, so the orbit approach takes over.
+                        self._event("search_done", rotated_deg=rotated, bearing_deg=bearing, needs_orbit=True)
+                        return
                     raise _FaultError(
                         f"tag found ahead (bearing {bearing:+.0f} deg) but unusable: {self._last_reason}"
                     )
-                # Turn towards the tag, at most one step.
+                # Turn towards the tag, at most one step. This also squares up a robot that stands in front of
+                # the table but is turned beyond the heading limit.
                 angle = max(-cfg.search_step_deg, min(cfg.search_step_deg, bearing))
             else:
                 angle = cfg.search_direction * cfg.search_step_deg

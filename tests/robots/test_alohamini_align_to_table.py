@@ -624,3 +624,16 @@ def test_scan_finds_the_tag_when_reversing_leaves_the_robot_turned_away(slip_deg
     found = [e for e in result.events if e["event"] == "recover_found"]
     assert len(found) == 1
     assert math.copysign(1, found[0]["offset_deg"]) == -math.copysign(1, slip_deg)  # turned back towards it
+
+
+@pytest.mark.parametrize("turn", [49.0, -49.0, 55.0])
+def test_turned_beyond_heading_limit_in_front_of_the_table_squares_up(turn):
+    # In front of the table, tag visible and fitted, but turned past +-45 deg: the search turns towards the
+    # tag until the heading is within the limit (no orbit - the robot is not displaced).
+    world = displaced(0.0, radius=0.5, extra_turn_deg=turn, fov_deg=60.0)
+    result = run(world)
+    assert result.ready, result.reason
+    turns = [e for e in result.events if e["event"] == "search_pulse"]
+    assert turns and all(e["status"] == "seen" for e in turns)
+    assert all(math.copysign(1, e["omega_degps"]) == -math.copysign(1, turn) for e in turns)
+    assert not [e for e in result.events if e["event"] == "orbit_pulse"]
