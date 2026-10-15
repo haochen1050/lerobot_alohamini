@@ -8,6 +8,7 @@ with detected tags drawn, for checking what the camera sees. Steps, in order:
 
   1. capture-charuco       Save views of the ChArUco board held in front of the camera.
   2. calibrate-intrinsics  Camera matrix + distortion from those views.
+     (Intel RealSense: `realsense-intrinsics` reads the factory calibration instead of steps 1-2.)
   3. calibrate-extrinsics  Camera pose on the robot, from the AprilTag lying flat at a measured floor spot.
   4. watch                 Print distance / lateral / heading errors to the table tag.
   5. teach                 Park the robot at the desired pose by hand and record it as the target.
@@ -161,6 +162,57 @@ def cmd_calibrate_intrinsics(args) -> None:
     print(f"Saved {args.out}")
 
 
+def cmd_realsense_intrinsics(args) -> None:
+    """Factory colour intrinsics of an Intel RealSense camera, saved in the ChArUco calibration format."""
+    try:
+        import pyrealsense2 as rs
+    except ImportError as e:
+        raise SystemExit("pyrealsense2 is not installed: pip install pyrealsense2") from e
+
+    devices = [
+        d
+        for d in rs.context().query_devices()
+        if not args.serial or d.get_info(rs.camera_info.serial_number) == args.serial
+    ]
+    if len(devices) != 1:
+        found = [d.get_info(rs.camera_info.serial_number) for d in rs.context().query_devices()]
+        raise SystemExit(f"Expected one RealSense device (--serial), found {found}")
+    device = devices[0]
+
+    profiles = [
+        p.as_video_stream_profile()
+        for sensor in device.query_sensors()
+        for p in sensor.get_stream_profiles()
+        if p.stream_type() == rs.stream.color and p.is_video_stream_profile()
+    ]
+    profiles = [p for p in profiles if (p.width(), p.height()) == (args.width, args.height)]
+    if not profiles:
+        raise SystemExit(f"No {args.width}x{args.height} colour stream on this device")
+    intr = profiles[0].get_intrinsics()
+
+    coeffs = np.array(intr.coeffs, dtype=float)
+    # OpenCV's model is Brown-Conrady with (k1, k2, p1, p2, k3) - the same order librealsense uses. The
+    # inverse model maps the other way, so it is only usable when it is (numerically) no distortion.
+    if intr.model == rs.distortion.none or (
+        intr.model == rs.distortion.inverse_brown_conrady and np.allclose(coeffs, 0, atol=1e-6)
+    ):
+        coeffs = np.zeros(5)
+    elif intr.model != rs.distortion.brown_conrady:
+        raise SystemExit(
+            f"Distortion model {intr.model} with coefficients {coeffs.tolist()} is not OpenCV-compatible; "
+            "calibrate with capture-charuco / calibrate-intrinsics instead"
+        )
+
+    K = np.array([[intr.fx, 0.0, intr.ppx], [0.0, intr.fy, intr.ppy], [0.0, 0.0, 1.0]])
+    CameraIntrinsics(K, coeffs, (intr.width, intr.height)).save(args.out)
+    print(f"{device.get_info(rs.camera_info.name)} serial {device.get_info(rs.camera_info.serial_number)}")
+    print(
+        f"fx={intr.fx:.1f} fy={intr.fy:.1f} cx={intr.ppx:.1f} cy={intr.ppy:.1f}  size={intr.width}x{intr.height}"
+    )
+    print(f"model={intr.model} dist={np.round(coeffs, 4).tolist()}")
+    print(f"Saved {args.out}")
+
+
 def describe_camera(T_base_cam: np.ndarray) -> str:
     x, y, z = T_base_cam[:3, 3]
     optical = T_base_cam[:3, 2]
@@ -215,7 +267,9 @@ def cmd_calibrate_extrinsics(args) -> None:
     )
     print(f"{len(observations)} frames, median reprojection {reproj:.2f} px")
     print(describe_camera(T_base_cam))
-    print("Sanity check x and z against your tape measure (camera lens position relative to the base centre).")
+    print(
+        "Sanity check x and z against your tape measure (camera lens position relative to the base centre)."
+    )
     print(f"Saved {args.extrinsics}")
 
     # The forward camera looks roughly along +x, so a large yaw means the tag is rotated by a multiple
@@ -466,6 +520,17 @@ def parse_args():
     sp.add_argument("--images", default=str(DEFAULTS["charuco_dir"]))
     sp.add_argument("--out", default=str(DEFAULTS["intrinsics"]))
     sp.set_defaults(func=cmd_calibrate_intrinsics)
+
+    sp = sub.add_parser(
+        "realsense-intrinsics", help="Read factory colour intrinsics from a RealSense (replaces steps 1-2)"
+    )
+    sp.add_argument(
+        "--serial", default=None, help="RealSense serial number (needed if several are connected)"
+    )
+    sp.add_argument("--width", type=int, default=640, help="Must match the resolution the scripts capture at")
+    sp.add_argument("--height", type=int, default=480)
+    sp.add_argument("--out", default=str(DEFAULTS["intrinsics"]))
+    sp.set_defaults(func=cmd_realsense_intrinsics)
 
     sp = sub.add_parser("calibrate-extrinsics")
     tag_args(sp)
