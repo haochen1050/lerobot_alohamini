@@ -215,7 +215,7 @@ def cmd_calibrate_extrinsics(args) -> None:
     )
     print(f"{len(observations)} frames, median reprojection {reproj:.2f} px")
     print(describe_camera(T_base_cam))
-    print("Sanity check against your tape measure (expected roughly x=10 cm, z=110 cm).")
+    print("Sanity check x and z against your tape measure (camera lens position relative to the base centre).")
     print(f"Saved {args.extrinsics}")
 
     # The forward camera looks roughly along +x, so a large yaw means the tag is rotated by a multiple
