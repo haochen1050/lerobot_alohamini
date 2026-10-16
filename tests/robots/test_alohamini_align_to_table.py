@@ -120,7 +120,7 @@ def test_full_alignment_converges_from_nearby_poses(x, y, yaw):
     assert abs(err.lateral_error_m) <= 0.025
     assert abs(err.heading_error_deg) <= 2.5
     # Last thing that happened to the base was a confirmed stop.
-    assert result.events[-1]["event"] == "ready"
+    assert [e["event"] for e in result.events[-2:]] == ["ready", "summary"]
 
 
 def test_already_aligned_does_not_move():
@@ -721,3 +721,60 @@ def test_round_table_final_approach_may_pass_inside_the_keepout_circle():
 def test_keepout_must_exceed_table_radius():
     with pytest.raises(ValueError):
         AlignConfig(table_radius_m=0.30, orbit_keepout_radius_m=0.25)
+
+
+# ---------------------------------------------------------------- start pose and summary
+
+
+def test_start_pose_is_measured_when_the_tag_is_usable_at_the_start():
+    world = SimWorld(x=-0.40, y=0.05, yaw_deg=8.0)
+    truth = world.true_error()
+    result = run(world)
+    assert result.ready, result.reason
+    assert result.start_source == "measured"
+    assert result.start_error.distance_error_m == pytest.approx(truth.distance_error_m, abs=1e-6)
+    assert result.start_error.lateral_error_m == pytest.approx(truth.lateral_error_m, abs=1e-6)
+    assert result.start_error.heading_error_deg == pytest.approx(truth.heading_error_deg, abs=1e-6)
+    summary = result.events[-1]
+    assert summary["event"] == "summary" and summary["state"] == "BASE_READY"
+    assert summary["steps"] == result.steps and summary["duration_s"] > 0
+    assert summary["start_source"] == "measured"
+
+
+def test_start_pose_is_reconstructed_after_a_blind_search():
+    # Facing away from the table: the search turns until it sees the tag. Turning in place keeps the position,
+    # so the estimated start pose matches the true one (the sim's wheels turn exactly as commanded).
+    world = FovWorld(x=-0.36, y=0.03, yaw_deg=120.0, efficiency=1.0)
+    truth = world.true_error()
+    result = run(world)
+    assert result.ready, result.reason
+    assert result.start_source == "estimated"
+    assert result.start_error.distance_error_m == pytest.approx(truth.distance_error_m, abs=1e-6)
+    assert result.start_error.lateral_error_m == pytest.approx(truth.lateral_error_m, abs=1e-6)
+    assert _wrap(result.start_error.heading_error_deg - truth.heading_error_deg) == pytest.approx(0, abs=1e-6)
+    pose = next(e for e in result.events if e["event"] == "start_pose")
+    assert pose["search_rotation_deg"] != 0
+
+
+def test_summary_is_written_on_fault_and_on_abort():
+    world = SimWorld(x=-0.36, yaw_deg=5.0)
+    world.lost_after = 6
+    result = run(world)
+    assert result.state is AlignState.FAULT
+    summary = result.events[-1]
+    assert summary["event"] == "summary" and summary["state"] == "FAULT" and summary["reason"]
+
+    world = SimWorld(x=-0.36, yaw_deg=5.0)
+
+    def interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    world.move_base_for = interrupt
+    align = AlignToTable(world, world, AlignConfig(), clock=world.clock, sleep=world.sleep)
+    with pytest.raises(KeyboardInterrupt):
+        align.run()
+    assert align._events[-1]["event"] == "summary" and align._events[-1]["state"] == "ABORTED"
+
+
+def _wrap(angle):
+    return (angle + 180.0) % 360.0 - 180.0

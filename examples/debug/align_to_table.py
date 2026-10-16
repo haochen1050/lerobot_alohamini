@@ -24,7 +24,9 @@ looking at the tag, or another axis corrected first), the tag is tracked during 
 early if it nears the image edge, and if it is lost anyway the pulse is reversed and, if needed, the base turns
 +-20 deg to find it again (--recover-scan-deg; --no-keep-view disables all of this).
 
-A JSONL log of every measurement, pulse, stop and state transition is written per trial.
+A JSONL log of every measurement, pulse, stop and state transition is written per trial, with the reading
+before the start ("initial"), the start pose ("start_pose": measured, or estimated after a blind search) and a
+"summary" at the end. examples/debug/align_report.py tabulates many trials.
 """
 
 from __future__ import annotations
@@ -51,11 +53,20 @@ from table_perception import (
 from lerobot.robots.alohamini.base import BaseController, BaseLimits, open_wheel_bus
 from lerobot.robots.alohamini.behaviors import AXES, ERROR_FIELD, AlignConfig, AlignToTable
 from lerobot.robots.alohamini.model_specs import ROBOT_SPECS
-from lerobot.robots.alohamini.perception import CameraIntrinsics
+from lerobot.robots.alohamini.perception import CameraIntrinsics, table_pose_error
 
 DEFAULT_PORT = "/dev/am_arm_follower_left"
 
 logger = logging.getLogger("align_to_table")
+
+
+def describe_error(e) -> str:
+    if e is None:
+        return "unknown"
+    return (
+        f"distance {e.distance_error_m * 100:+.1f} cm, lateral {e.lateral_error_m * 100:+.1f} cm, "
+        f"heading {e.heading_error_deg:+.1f} deg"
+    )
 
 
 def _raise_interrupt(signum, _frame):
@@ -74,6 +85,9 @@ def parse_args():
     )
     p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
     p.add_argument("--log-dir", default=str(OUT / "logs"))
+    p.add_argument(
+        "--note", default="", help="Free text saved with the trial (e.g. the start spot), for reports"
+    )
     p.add_argument("--timeout-s", type=float, default=AlignConfig.timeout_s, help="Overall alignment timeout")
     p.add_argument(
         "--max-travel",
@@ -155,6 +169,19 @@ def main() -> int:
         cam.wait_first()
         time.sleep(0.5)
         err = estimator.get_table_pose_error()
+        initial = {
+            "event": "initial",
+            "valid": err.valid,
+            "reason": err.reason,
+            "error": asdict(err),
+            "tag_bearing_deg": estimator.last_tag_bearing_deg,
+            "tag_edge_margin_px": estimator.last_tag_margin_px,
+        }
+        if not err.valid and estimator.last_raw_T_base_table is not None:
+            # Tag fitted but rejected (e.g. heading beyond the limit): record the pose anyway.
+            initial["raw_error"] = asdict(
+                table_pose_error(estimator.last_raw_T_base_table, target, err.timestamp_s)
+            )
         if err.valid:
             print(
                 f"Current error: distance {err.distance_error_m * 100:+.1f} cm, "
@@ -162,6 +189,12 @@ def main() -> int:
                 f"Correcting: {', '.join(axes)}"
             )
         elif config.search:
+            if "raw_error" in initial:
+                raw = initial["raw_error"]
+                print(
+                    f"Tag seen but rejected: distance {raw['distance_error_m'] * 100:+.1f} cm, "
+                    f"lateral {raw['lateral_error_m'] * 100:+.1f} cm, heading {raw['heading_error_deg']:+.1f} deg"
+                )
             print(
                 f"Tag not usable yet ({err.reason}). Will rotate {args.search_direction.upper()} in "
                 f"{config.search_step_deg:g} deg steps at {config.search_speed_degps:g} deg/s to find it "
@@ -211,16 +244,28 @@ def main() -> int:
                 log_file.write(json.dumps(event, default=str) + "\n")
                 log_file.flush()
 
-            log({"event": "trial", "axes": axes, "target": asdict(target), "tag": vars(args)})
+            log(
+                {
+                    "event": "trial",
+                    "axes": axes,
+                    "target": asdict(target),
+                    "tag": vars(args),
+                    "note": args.note,
+                }
+            )
+            log(initial)
             try:
                 result = AlignToTable(base, estimator, config, log=log).run()
-                e = result.final_error
-                print(f"\n{result.state.value} after {result.steps} pulses. {result.reason}")
-                if e is not None:
-                    print(
-                        f"Final error: distance {e.distance_error_m * 100:+.1f} cm, "
-                        f"lateral {e.lateral_error_m * 100:+.1f} cm, heading {e.heading_error_deg:+.1f} deg"
-                    )
+                print(
+                    f"\n{result.state.value} after {result.steps} pulses in {result.duration_s:.0f} s. {result.reason}"
+                )
+                print(f"Start ({result.start_source}): {describe_error(result.start_error)}")
+                print(f"Final error: {describe_error(result.final_error)}")
+                summary = result.events[-1]
+                print(
+                    f"Searched {summary['search_rotation_deg']:+.0f} deg, orbited {summary['orbit_deg']:+.0f} deg, "
+                    f"recoveries {summary['recoveries']}"
+                )
                 exit_code = 0 if result.ready else 1
             except KeyboardInterrupt:
                 logger.info("Interrupted")

@@ -48,7 +48,7 @@ from typing import Any
 import numpy as np
 
 from ..base import BaseController, BaseStopError
-from ..perception import TablePoseError, TablePoseEstimator, measure_table_pose
+from ..perception import TablePoseError, TablePoseEstimator, measure_table_pose, table_pose_error
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +199,11 @@ class AlignResult:
     reason: str = ""
     steps: int = 0
     final_error: TablePoseError | None = None
+    # Pose error where the robot started: "measured" when the tag was usable there, "estimated" when it was
+    # reconstructed after a search (the search only rotates in place), "unknown" if no fix was obtained.
+    start_error: TablePoseError | None = None
+    start_source: str = "unknown"
+    duration_s: float = 0.0
     events: list[dict[str, Any]] = field(default_factory=list)
 
     @property
@@ -269,6 +274,11 @@ class AlignToTable:
         self._recoveries = 0
         self._scale = dict.fromkeys((*AXES, "orbit"), 1.0)
         self._last_pulse: tuple[tuple[float, float, float], float] | None = None
+        # Motion outside the per-axis stages, for the run summary.
+        self._searched_deg = 0.0  # signed: + = counter-clockwise
+        self._orbited_deg = 0.0
+        self._result = result
+        run_start = self._clock()
         verified = 0
         state = AlignState.ESTIMATE
         self._event("start", config=asdict(cfg))
@@ -276,6 +286,7 @@ class AlignToTable:
         try:
             if cfg.search:
                 self._search()
+            self._record_start_pose()
             if cfg.orbit:
                 self._orbit()
             # Alignment timeout and travel limits apply from here; the search has its own rotation budget.
@@ -323,12 +334,86 @@ class AlignToTable:
         except BaseStopError as e:
             result.state, result.reason = AlignState.FAULT, f"stop not confirmed: {e}"
             self._event("fault", reason=result.reason, steps=result.steps)
+            self._summarize(result, run_start)
             raise
         except BaseException:
             self.base.stop_base()
+            result.reason = "aborted"
             self._event("aborted", steps=result.steps)
+            self._summarize(result, run_start, aborted=True)
             raise
+        self._summarize(result, run_start)
         return result
+
+    # ------------------------------------------------------------------ start pose and summary
+
+    def _start_fix(self) -> TablePoseError | None:
+        """Median pose error over a few fresh frames, including poses beyond the heading limit when the
+        estimator exposes them. None (not a fault) if no fix arrives."""
+        target = getattr(self.estimator, "target", None)
+        samples: list[TablePoseError] = []
+        try:
+            for looked, err in enumerate(self._fresh_frames(), start=1):
+                raw = getattr(self.estimator, "last_raw_T_base_table", None)
+                if raw is not None and target is not None:
+                    err = table_pose_error(raw, target, err.timestamp_s)
+                if err.valid:
+                    samples.append(err)
+                if len(samples) >= self.config.samples_per_measurement or looked >= 15:
+                    break
+        except _PerceptionLostError:
+            pass
+        if not samples:
+            return None
+        return TablePoseError(
+            distance_error_m=statistics.median(e.distance_error_m for e in samples),
+            lateral_error_m=statistics.median(e.lateral_error_m for e in samples),
+            heading_error_deg=statistics.median(e.heading_error_deg for e in samples),
+            timestamp_s=samples[-1].timestamp_s,
+            valid=True,
+        )
+
+    def _record_start_pose(self) -> None:
+        """Log where the robot started. After a search, rotating in place leaves the base centre where it was,
+        so the start position is the current one and the start heading is the current one plus the commanded
+        rotation (off by however much the wheels slipped while turning)."""
+        fix = self._start_fix()
+        result = self._result
+        if fix is None:
+            self._event("start_pose", source="unknown")
+            return
+        rotated = self._searched_deg
+        result.start_source = "estimated" if abs(rotated) > 1e-9 else "measured"
+        result.start_error = TablePoseError(
+            fix.distance_error_m,
+            fix.lateral_error_m,
+            _wrap_deg(fix.heading_error_deg + rotated),
+            fix.timestamp_s,
+            True,
+        )
+        self._event(
+            "start_pose",
+            source=result.start_source,
+            search_rotation_deg=rotated,
+            error=asdict(result.start_error),
+        )
+
+    def _summarize(self, result: AlignResult, run_start: float, *, aborted: bool = False) -> None:
+        result.duration_s = self._clock() - run_start
+        self._event(
+            "summary",
+            state="ABORTED" if aborted else result.state.value,
+            reason=result.reason,
+            steps=result.steps,
+            duration_s=result.duration_s,
+            start_source=result.start_source,
+            start_error=None if result.start_error is None else asdict(result.start_error),
+            final_error=None if result.final_error is None else asdict(result.final_error),
+            search_rotation_deg=self._searched_deg,
+            orbit_deg=self._orbited_deg,
+            recoveries=self._recoveries,
+            travel=dict(self._travel),
+        )
 
     # ------------------------------------------------------------------ helpers
 
@@ -451,6 +536,7 @@ class AlignToTable:
             self.base.move_base_for(0.0, 0.0, speed, duration)
             self._motion_end = self._clock()
             rotated += abs(angle)
+            self._searched_deg += angle
 
     def _orbit_state(self) -> tuple[float, float, np.ndarray]:
         """(angle around the orbit centre minus the taught one [deg], distance to the table edge [m], orbit
@@ -556,12 +642,14 @@ class AlignToTable:
             _stop, elapsed = self._move(command, duration)
             orbit = omega_deg * elapsed
             orbited += abs(orbit)
+            self._orbited_deg += orbit
 
             try:
                 new_err, distance, pivot = self._orbit_state()
             except _PerceptionLostError as lost:
                 angle_err, distance, pivot = self._recover(lost, self._orbit_state)
                 orbited -= abs(orbit)
+                self._orbited_deg -= orbit
                 self._scale["orbit"] *= 0.5
                 continue
             if abs(new_err) > abs(angle_err) - 0.3 * abs(orbit):
