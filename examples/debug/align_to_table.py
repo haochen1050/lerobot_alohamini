@@ -93,7 +93,7 @@ def parse_args():
         type=float,
         default=None,
         help="With --table-radius: minimum distance (m) from the table centre to the base centre while orbiting "
-        "(default: table radius + 0.40)",
+        "(default: table radius + 0.35)",
     )
     p.add_argument(
         "--no-keep-view",

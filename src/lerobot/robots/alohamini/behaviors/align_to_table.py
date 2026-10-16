@@ -126,7 +126,7 @@ class AlignConfig:
     # For a round table, set table_radius_m: the orbit then circles the table centre (table_radius_m into the
     # table from the approach point), and instead of orbit_min_distance_m from a straight edge, the base centre
     # must stay at least orbit_keepout_radius_m from the table centre during the orbit (default: table radius
-    # + 0.40 m, i.e. a 0.25 m robot footprint plus 0.15 m margin). Only the final approach, after the orbit, may
+    # + 0.35 m, i.e. a 0.25 m robot footprint plus 0.10 m margin). Only the final approach, after the orbit, may
     # go closer (under the tabletop), guarded by max_approach_overshoot_m.
     orbit: bool = True
     table_radius_m: float | None = None
@@ -185,7 +185,7 @@ class AlignConfig:
             return None
         if self.orbit_keepout_radius_m is not None:
             return self.orbit_keepout_radius_m
-        return self.table_radius_m + 0.40
+        return self.table_radius_m + 0.35
 
     def axis(self, name: str) -> AxisConfig:
         return getattr(self, name)

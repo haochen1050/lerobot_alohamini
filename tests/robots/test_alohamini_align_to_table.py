@@ -684,28 +684,28 @@ def test_round_table_orbit_keeps_distance_to_the_rim():
     assert n_orbit >= 3
     orbit_distances = distances[:n_orbit]
     assert max(orbit_distances) - min(orbit_distances) < 0.03
-    assert min(orbit_distances) > 0.70 - 0.03  # never inside the default keep-out circle (0.30 + 0.40)
+    assert min(orbit_distances) > 0.65 - 0.03  # never inside the default keep-out circle (0.30 + 0.35)
 
 
 def test_round_table_orbit_refuses_inside_the_keepout_circle():
-    world = around_round_table(40.0, 0.65, fov_deg=40.0)
-    result = run(world, table_radius_m=0.30)  # keep-out defaults to 0.70 m from the table centre
+    world = around_round_table(40.0, 0.62, fov_deg=40.0)
+    result = run(world, table_radius_m=0.30)  # keep-out defaults to 0.65 m from the table centre
     assert result.state is AlignState.FAULT
     assert "keep-out" in result.reason
     assert not [e for e in result.events if e["event"] == "orbit_pulse"]
 
-    world = around_round_table(40.0, 0.65, fov_deg=40.0)
-    result = run(world, table_radius_m=0.30, orbit_keepout_radius_m=0.60)
+    world = around_round_table(40.0, 0.62, fov_deg=40.0)
+    result = run(world, table_radius_m=0.30, orbit_keepout_radius_m=0.58)
     assert result.ready, result.reason
 
 
 def test_round_table_final_approach_may_pass_inside_the_keepout_circle():
-    # The taught target is 0.30 + 0.30 = 0.60 m from the table centre, inside the 0.70 m keep-out: only the
+    # The taught target is 0.30 + 0.30 = 0.60 m from the table centre, inside the 0.65 m keep-out: only the
     # orbit is kept out, the final approach along the approach line still reaches the target.
     world = around_round_table(30.0, 0.80, fov_deg=40.0)
     result = run(world, table_radius_m=0.30)
     assert result.ready, result.reason
-    assert math.hypot(world.x - 0.30, world.y) < 0.70
+    assert math.hypot(world.x - 0.30, world.y) < 0.65
 
 
 def test_keepout_must_exceed_table_radius():
