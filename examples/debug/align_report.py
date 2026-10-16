@@ -89,7 +89,7 @@ def summarize(path: Path) -> dict | None:
             time_s=round(summary["duration_s"], 1),
             start_source=summary["start_source"],
             search_deg=round(summary["search_rotation_deg"]),
-            radial_cm=round(summary.get("radial_m", 0.0) * 100),
+            radial_cm=round(summary["radial_m"] * 100) if "radial_m" in summary else None,
             orbit_deg=round(summary["orbit_deg"]),
             recoveries=summary["recoveries"],
         )
