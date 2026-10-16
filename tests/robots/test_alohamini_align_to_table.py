@@ -196,6 +196,16 @@ def test_workspace_limit():
     assert "workspace" in result.reason or "grew" in result.reason
 
 
+def test_translation_budget_counts_commanded_travel():
+    # Wheels deliver half of what is commanded: 0.25 m of real approach needs ~0.5 m of commands.
+    world = SimWorld(x=-0.55, efficiency=0.5)
+    assert run(world, axes=("distance",)).ready
+    world = SimWorld(x=-0.55, efficiency=0.5)
+    result = run(world, axes=("distance",), max_total_translation_m=0.40)
+    assert result.state is AlignState.FAULT
+    assert "workspace limit" in result.reason
+
+
 def test_timeout():
     world = SimWorld(yaw_deg=10.0, efficiency=0.05)
     result = run(world, axes=("heading",), timeout_s=3.0, max_total_rotation_deg=1000)

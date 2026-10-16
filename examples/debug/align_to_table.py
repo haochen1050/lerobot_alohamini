@@ -75,6 +75,13 @@ def parse_args():
     p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
     p.add_argument("--log-dir", default=str(OUT / "logs"))
     p.add_argument("--timeout-s", type=float, default=AlignConfig.timeout_s, help="Overall alignment timeout")
+    p.add_argument(
+        "--max-travel",
+        type=float,
+        default=AlignConfig.max_total_translation_m,
+        help="Net translation (m) the heading/lateral/distance stages may command in one run "
+        "(search and orbit not counted)",
+    )
     p.add_argument("--no-search", action="store_true", help="Fault instead of rotating to find the tag")
     p.add_argument(
         "--no-orbit",
@@ -125,6 +132,7 @@ def main() -> int:
     config = AlignConfig(
         axes=axes,
         timeout_s=args.timeout_s,
+        max_total_translation_m=args.max_travel,
         search=not args.no_search,
         orbit=not args.no_orbit,
         keep_tag_in_view=not args.no_keep_view,

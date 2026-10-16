@@ -100,9 +100,11 @@ class AlignConfig:
     samples_per_measurement: int = 3
     measurement_timeout_s: float = 2.0
     verify_consecutive: int = 3
-    max_steps: int = 40
+    max_steps: int = 50
     timeout_s: float = 120.0
-    max_total_translation_m: float = 0.40
+    # Net commanded travel allowed in the heading/lateral/distance stages (search and orbit not counted):
+    # sqrt(x^2 + y^2) of the signed forward and sideways totals, and the signed rotation total.
+    max_total_translation_m: float = 0.60
     max_total_rotation_deg: float = 60.0
     # Never command the reference point closer to the edge than (taught distance - this).
     max_approach_overshoot_m: float = 0.03
