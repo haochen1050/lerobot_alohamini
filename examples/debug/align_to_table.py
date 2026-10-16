@@ -85,8 +85,15 @@ def parse_args():
         "--table-radius",
         type=float,
         default=None,
-        help="Round table radius (m): orbit around the table centre and check the distance to the rim "
+        help="Round table radius (m): orbit around the table centre, outside --keepout-radius "
         "(default: straight edge, orbit around the approach point)",
+    )
+    p.add_argument(
+        "--keepout-radius",
+        type=float,
+        default=None,
+        help="With --table-radius: minimum distance (m) from the table centre to the base centre while orbiting "
+        "(default: table radius + 0.40)",
     )
     p.add_argument(
         "--no-keep-view",
@@ -123,6 +130,7 @@ def main() -> int:
         keep_tag_in_view=not args.no_keep_view,
         recover_scan_deg=args.recover_scan_deg,
         table_radius_m=args.table_radius,
+        orbit_keepout_radius_m=args.keepout_radius,
         search_direction=1 if args.search_direction == "ccw" else -1,
     )
 

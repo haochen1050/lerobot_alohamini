@@ -124,10 +124,13 @@ class AlignConfig:
     # (displaced, not just turned), circle the approach point (table frame origin) at constant distance until
     # within orbit_exit_deg; the per-axis stages then finish. Each step must reduce the angle.
     # For a round table, set table_radius_m: the orbit then circles the table centre (table_radius_m into the
-    # table from the approach point) and orbit_min_distance_m is checked against the real distance to the rim,
-    # instead of a straight edge through the approach point.
+    # table from the approach point), and instead of orbit_min_distance_m from a straight edge, the base centre
+    # must stay at least orbit_keepout_radius_m from the table centre during the orbit (default: table radius
+    # + 0.40 m, i.e. a 0.25 m robot footprint plus 0.15 m margin). Only the final approach, after the orbit, may
+    # go closer (under the tabletop), guarded by max_approach_overshoot_m.
     orbit: bool = True
     table_radius_m: float | None = None
+    orbit_keepout_radius_m: float | None = None
     orbit_trigger_deg: float = 10.0
     orbit_exit_deg: float = 3.0
     orbit_step_deg: float = 10.0
@@ -172,6 +175,17 @@ class AlignConfig:
             raise ValueError(f"axes must be a non-empty subset of {AXES}, got {self.axes}")
         if self.search_direction not in (1, -1):
             raise ValueError("search_direction must be +1 (CCW) or -1 (CW)")
+        if self.table_radius_m is not None and self.keepout_radius_m <= self.table_radius_m:
+            raise ValueError("orbit_keepout_radius_m must be larger than table_radius_m")
+
+    @property
+    def keepout_radius_m(self) -> float | None:
+        """Minimum table-centre-to-base-centre distance during the orbit (round table only)."""
+        if self.table_radius_m is None:
+            return None
+        if self.orbit_keepout_radius_m is not None:
+            return self.orbit_keepout_radius_m
+        return self.table_radius_m + 0.40
 
     def axis(self, name: str) -> AxisConfig:
         return getattr(self, name)
@@ -468,6 +482,16 @@ class AlignToTable:
         samples.sort(key=lambda sample: sample[0])
         return samples[len(samples) // 2]
 
+    def _closest_approach(
+        self, point: np.ndarray, command: tuple[float, float, float], duration: float
+    ) -> float:
+        """Smallest predicted distance from the base centre to ``point`` (base-frame xy) along a pulse."""
+        closest = float(np.hypot(*point))
+        for fraction in (0.25, 0.5, 0.75, 1.0, self.config.view_overshoot):
+            dx, dy, dyaw = body_displacement(*command, fraction * duration)
+            closest = min(closest, float(np.hypot(point[0] - dx, point[1] - dy)))
+        return closest
+
     def _orbit(self) -> None:
         cfg = self.config
         if not hasattr(self.estimator, "last_raw_T_base_table") or not hasattr(self.estimator, "target"):
@@ -483,13 +507,19 @@ class AlignToTable:
                     f"robot {angle_err:+.0f} deg around the table from the approach line (limit "
                     f"{cfg.max_orbit_angle_deg:g}); if the robot is roughly in front, the tag was turned"
                 )
-            if distance < cfg.orbit_min_distance_m:
-                raise _FaultError(
-                    f"too close to the table to orbit safely ({distance * 100:.0f} cm from the "
-                    f"{'rim' if cfg.table_radius_m else 'edge line'}; minimum {cfg.orbit_min_distance_m * 100:.0f} cm)"
-                    + ("" if cfg.table_radius_m else ". For a round table pass its radius (--table-radius)")
-                )
             radius = float(np.hypot(*pivot))
+            keepout = cfg.keepout_radius_m
+            if keepout is not None and radius < keepout:
+                raise _FaultError(
+                    f"inside the orbit keep-out circle: base centre {radius * 100:.0f} cm from the table centre, "
+                    f"minimum {keepout * 100:.0f} cm. Move the robot further from the table"
+                )
+            if keepout is None and distance < cfg.orbit_min_distance_m:
+                raise _FaultError(
+                    f"too close to the table to orbit safely ({distance * 100:.0f} cm from the edge line; "
+                    f"minimum {cfg.orbit_min_distance_m * 100:.0f} cm). For a round table pass its radius "
+                    "(--table-radius)"
+                )
             # Slow down on large radii so the base's linear speed stays bounded, and keep pulses short.
             omega_deg = min(cfg.orbit_speed_degps, math.degrees(cfg.orbit_max_linear_mps / radius))
             step = min(cfg.orbit_step_deg, omega_deg * cfg.orbit_max_pulse_s) * self._scale["orbit"]
@@ -506,6 +536,14 @@ class AlignToTable:
                 command, duration = self._plan_in_view(command, abs(orbit) / abs(omega_deg), look_at=False)
             except _ViewBlockedError as e:
                 raise _FaultError(f"orbit would take the tag out of view: {e}") from e
+            if keepout is not None:
+                closest = self._closest_approach(pivot, command, duration)
+                # 1 cm of slack for the discretised path; an orbit about the centre keeps the radius constant.
+                if closest < keepout - 0.01:
+                    raise _FaultError(
+                        f"orbit pulse would bring the base to {closest * 100:.0f} cm from the table centre "
+                        f"(keep-out {keepout * 100:.0f} cm)"
+                    )
             self._event(
                 "orbit_pulse",
                 angle_error_deg=angle_err,
