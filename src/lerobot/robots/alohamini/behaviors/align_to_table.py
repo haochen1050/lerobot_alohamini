@@ -133,6 +133,14 @@ class AlignConfig:
     orbit: bool = True
     table_radius_m: float | None = None
     orbit_keepout_radius_m: float | None = None
+    # Round table: first move straight towards or away from the table centre until the base centre is
+    # orbit_radius_m from it (default: keep-out + orbit_radius_margin_m), then orbit on that circle if needed.
+    # Gives a short final approach, and backs a robot that needs to orbit out of the keep-out circle. A robot
+    # already in front of the table (no orbit needed) only moves in to the circle, never out.
+    orbit_radius_m: float | None = None
+    orbit_radius_margin_m: float = 0.03
+    orbit_radius_tolerance_m: float = 0.02
+    max_radial_travel_m: float = 0.60
     orbit_trigger_deg: float = 10.0
     orbit_exit_deg: float = 3.0
     orbit_step_deg: float = 10.0
@@ -179,6 +187,8 @@ class AlignConfig:
             raise ValueError("search_direction must be +1 (CCW) or -1 (CW)")
         if self.table_radius_m is not None and self.keepout_radius_m <= self.table_radius_m:
             raise ValueError("orbit_keepout_radius_m must be larger than table_radius_m")
+        if self.table_radius_m is not None and self.orbit_ring_m < self.keepout_radius_m:
+            raise ValueError("orbit_radius_m must not be smaller than the keep-out radius")
 
     @property
     def keepout_radius_m(self) -> float | None:
@@ -188,6 +198,15 @@ class AlignConfig:
         if self.orbit_keepout_radius_m is not None:
             return self.orbit_keepout_radius_m
         return self.table_radius_m + 0.35
+
+    @property
+    def orbit_ring_m(self) -> float | None:
+        """Distance from the table centre at which the robot orbits (round table only)."""
+        if self.table_radius_m is None:
+            return None
+        if self.orbit_radius_m is not None:
+            return self.orbit_radius_m
+        return self.keepout_radius_m + self.orbit_radius_margin_m
 
     def axis(self, name: str) -> AxisConfig:
         return getattr(self, name)
@@ -277,6 +296,7 @@ class AlignToTable:
         # Motion outside the per-axis stages, for the run summary.
         self._searched_deg = 0.0  # signed: + = counter-clockwise
         self._orbited_deg = 0.0
+        self._radial_m = 0.0  # signed: + = towards the table centre
         self._result = result
         run_start = self._clock()
         verified = 0
@@ -411,6 +431,7 @@ class AlignToTable:
             final_error=None if result.final_error is None else asdict(result.final_error),
             search_rotation_deg=self._searched_deg,
             orbit_deg=self._orbited_deg,
+            radial_m=self._radial_m,
             recoveries=self._recoveries,
             travel=dict(self._travel),
         )
@@ -580,6 +601,54 @@ class AlignToTable:
             closest = min(closest, float(np.hypot(point[0] - dx, point[1] - dy)))
         return closest
 
+    def _move_to_orbit_ring(self, centre: np.ndarray) -> tuple[float, float, np.ndarray]:
+        """Drive straight towards / away from the table centre (base-frame xy ``centre``) until the base centre is
+        orbit_ring_m from it. Returns the orbit state there."""
+        cfg = self.config
+        ring, keepout = cfg.orbit_ring_m, cfg.keepout_radius_m
+        moved = 0.0
+        while True:
+            radius = float(np.hypot(*centre))
+            error = radius - ring  # + = too far out: move towards the centre
+            if abs(error) <= cfg.orbit_radius_tolerance_m:
+                self._event("radial_done", radius_m=radius, moved_m=moved)
+                return self._orbit_state()
+            step = _clamp(error, cfg.orbit_max_linear_mps * cfg.orbit_max_pulse_s)
+            if moved + abs(step) > cfg.max_radial_travel_m:
+                raise _FaultError(
+                    f"radial move limit: moved {moved * 100:.0f} cm, still {error * 100:+.0f} cm from the "
+                    f"{ring * 100:.0f} cm orbit circle"
+                )
+            unit = centre / radius
+            speed = math.copysign(cfg.orbit_max_linear_mps, step)
+            command = (unit[0] * speed, unit[1] * speed, 0.0)
+            try:
+                command, duration = self._plan_in_view(
+                    command, abs(step) / cfg.orbit_max_linear_mps, look_at=True
+                )
+            except _ViewBlockedError as e:
+                raise _FaultError(f"moving to the orbit circle would take the tag out of view: {e}") from e
+            if step > 0 and self._closest_approach(centre, command, duration) < keepout - 0.01:
+                raise _FaultError("moving to the orbit circle would enter the keep-out circle")
+            self._event("radial_pulse", radius_m=radius, ring_m=ring, command=command, duration_s=duration)
+            _stop, elapsed = self._move(command, duration)
+            moved += abs(math.hypot(command[0], command[1]) * elapsed)
+            self._radial_m += math.copysign(math.hypot(command[0], command[1]) * elapsed, step)
+
+            try:
+                _angle, _distance, new_centre = self._orbit_state()
+            except _PerceptionLostError as lost:
+                _angle, _distance, centre = self._recover(lost, self._orbit_state)
+                continue
+            new_error = float(np.hypot(*new_centre)) - ring
+            travelled = math.hypot(command[0], command[1]) * elapsed
+            if abs(new_error) > abs(error) - 0.3 * travelled:
+                raise _FaultError(
+                    f"radial move did not reduce the distance to the orbit circle ({error * 100:+.1f} -> "
+                    f"{new_error * 100:+.1f} cm): slipping, or the tag moved"
+                )
+            centre = new_centre
+
     def _orbit(self) -> None:
         cfg = self.config
         if not hasattr(self.estimator, "last_raw_T_base_table") or not hasattr(self.estimator, "target"):
@@ -587,7 +656,15 @@ class AlignToTable:
             return
         orbited = 0.0
         angle_err, distance, pivot = self._orbit_state()
-        if abs(angle_err) <= cfg.orbit_trigger_deg:
+        needs_orbit = abs(angle_err) > cfg.orbit_trigger_deg
+        ring = cfg.orbit_ring_m
+        if ring is not None and abs(angle_err) <= cfg.max_orbit_angle_deg:
+            # Round table: go to the orbit circle first - before orbiting, and also when no orbit is needed but the
+            # robot starts further out (1 s radial pulses cover distance much faster than the distance stage).
+            outside = float(np.hypot(*pivot)) > ring + cfg.orbit_radius_tolerance_m
+            if needs_orbit or outside:
+                angle_err, distance, pivot = self._move_to_orbit_ring(pivot)
+        if not needs_orbit:
             return
         while abs(angle_err) > cfg.orbit_exit_deg:
             if abs(angle_err) > cfg.max_orbit_angle_deg:

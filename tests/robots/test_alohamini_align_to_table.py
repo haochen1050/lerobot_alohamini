@@ -677,36 +677,67 @@ def test_round_table_orbit_circles_the_table_centre():
     assert abs(err.distance_error_m) <= 0.02 and abs(err.lateral_error_m) <= 0.02
 
 
-def test_round_table_orbit_keeps_distance_to_the_rim():
-    world = around_round_table(-40.0, 0.75, fov_deg=40.0)
-    distances = []
+def run_tracking_centre_distance(world, **config):
+    """Run, recording (event kind of the pulse, distance from the base centre to the table centre after it)."""
+    events: list[dict] = []
+    track: list[tuple[str, float]] = []
     move = world.move_base_for
 
     def tracked(*args, **kwargs):
         result = move(*args, **kwargs)
-        distances.append(math.hypot(world.x - 0.30, world.y))
+        track.append((events[-1]["event"], math.hypot(world.x - 0.30, world.y)))
         return result
 
     world.move_base_for = tracked
-    result = run(world, table_radius_m=0.30, axes=("heading",))  # orbit, then heading only
+    align = AlignToTable(
+        world, world, AlignConfig(**config), log=events.append, clock=world.clock, sleep=world.sleep
+    )
+    return align.run(), track
+
+
+@pytest.mark.parametrize(("start", "kind"), [(0.95, "in"), (0.60, "out")])
+def test_round_table_moves_to_the_orbit_circle_then_orbits_on_it(start, kind):
+    # Default orbit circle: keep-out 0.65 + 0.03 = 0.68 m from the table centre. From further out the robot first
+    # drives in to it; from inside the keep-out circle it first backs out to it.
+    world = around_round_table(40.0, start, fov_deg=40.0)
+    result, track = run_tracking_centre_distance(world, table_radius_m=0.30)
     assert result.ready, result.reason
-    n_orbit = len([e for e in result.events if e["event"] == "orbit_pulse"])
-    assert n_orbit >= 3
-    orbit_distances = distances[:n_orbit]
-    assert max(orbit_distances) - min(orbit_distances) < 0.03
-    assert min(orbit_distances) > 0.65 - 0.03  # never inside the default keep-out circle (0.30 + 0.35)
+
+    radial = [d for k, d in track if k == "radial_pulse"]
+    orbit = [d for k, d in track if k == "orbit_pulse"]
+    assert radial and orbit
+    assert (radial[-1] < start) if kind == "in" else (radial[-1] > start)
+    assert all(abs(d - 0.68) <= 0.03 for d in orbit), orbit
+    assert min(orbit) >= 0.65 - 0.01  # never inside the keep-out circle while orbiting
 
 
-def test_round_table_orbit_refuses_inside_the_keepout_circle():
-    world = around_round_table(40.0, 0.62, fov_deg=40.0)
-    result = run(world, table_radius_m=0.30)  # keep-out defaults to 0.65 m from the table centre
-    assert result.state is AlignState.FAULT
-    assert "keep-out" in result.reason
-    assert not [e for e in result.events if e["event"] == "orbit_pulse"]
-
-    world = around_round_table(40.0, 0.62, fov_deg=40.0)
-    result = run(world, table_radius_m=0.30, orbit_keepout_radius_m=0.58)
+def test_round_table_orbit_radius_can_be_set():
+    world = around_round_table(-35.0, 0.95, fov_deg=40.0)
+    result, track = run_tracking_centre_distance(world, table_radius_m=0.30, orbit_radius_m=0.80)
     assert result.ready, result.reason
+    orbit = [d for k, d in track if k == "orbit_pulse"]
+    assert orbit and all(abs(d - 0.80) <= 0.03 for d in orbit)
+
+
+def test_round_table_in_front_but_far_moves_in_without_orbiting():
+    world = around_round_table(3.0, 1.05, fov_deg=40.0, efficiency=0.7)
+    result, track = run_tracking_centre_distance(world, table_radius_m=0.30)
+    assert result.ready, result.reason
+    assert [k for k, _d in track if k == "radial_pulse"]
+    assert not [k for k, _d in track if k == "orbit_pulse"]
+
+
+def test_round_table_in_front_and_close_has_no_radial_move():
+    # Inside the orbit circle but already in front: the per-axis stages finish; it never backs out.
+    world = around_round_table(3.0, 0.62, fov_deg=40.0)
+    result, track = run_tracking_centre_distance(world, table_radius_m=0.30)
+    assert result.ready, result.reason
+    assert not [k for k, _d in track if k in ("radial_pulse", "orbit_pulse")]
+
+
+def test_orbit_radius_inside_keepout_rejected():
+    with pytest.raises(ValueError):
+        AlignConfig(table_radius_m=0.30, orbit_radius_m=0.60)
 
 
 def test_round_table_final_approach_may_pass_inside_the_keepout_circle():

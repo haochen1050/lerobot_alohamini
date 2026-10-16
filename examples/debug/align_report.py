@@ -34,6 +34,7 @@ COLUMNS = [
     ("start_lateral_cm", "lat0", 6),
     ("start_heading_deg", "head0", 6),
     ("search_deg", "search", 6),
+    ("radial_cm", "radial", 6),
     ("orbit_deg", "orbit", 6),
     ("recoveries", "recov", 5),
     ("final_distance_cm", "dist", 6),
@@ -88,6 +89,7 @@ def summarize(path: Path) -> dict | None:
             time_s=round(summary["duration_s"], 1),
             start_source=summary["start_source"],
             search_deg=round(summary["search_rotation_deg"]),
+            radial_cm=round(summary.get("radial_m", 0.0) * 100),
             orbit_deg=round(summary["orbit_deg"]),
             recoveries=summary["recoveries"],
         )
@@ -106,6 +108,7 @@ def summarize(path: Path) -> dict | None:
             search_deg=round(
                 sum(e["omega_degps"] * e["duration_s"] for e in events if e["event"] == "search_pulse")
             ),
+            radial_cm=None,
             orbit_deg=None,
             recoveries=sum(1 for e in events if e["event"] == "recover"),
         )

@@ -117,6 +117,13 @@ def parse_args():
         "(default: table radius + 0.35)",
     )
     p.add_argument(
+        "--orbit-radius",
+        type=float,
+        default=None,
+        help="With --table-radius: before orbiting, move to this distance (m) from the table centre and orbit "
+        "there (default: keep-out radius + 0.03)",
+    )
+    p.add_argument(
         "--no-keep-view",
         action="store_true",
         help="Do not plan/watch pulses to keep the tag in the image, or reverse a pulse that lost it",
@@ -153,6 +160,7 @@ def main() -> int:
         recover_scan_deg=args.recover_scan_deg,
         table_radius_m=args.table_radius,
         orbit_keepout_radius_m=args.keepout_radius,
+        orbit_radius_m=args.orbit_radius,
         search_direction=1 if args.search_direction == "ccw" else -1,
     )
 
@@ -263,7 +271,8 @@ def main() -> int:
                 print(f"Final error: {describe_error(result.final_error)}")
                 summary = result.events[-1]
                 print(
-                    f"Searched {summary['search_rotation_deg']:+.0f} deg, orbited {summary['orbit_deg']:+.0f} deg, "
+                    f"Searched {summary['search_rotation_deg']:+.0f} deg, moved {summary['radial_m'] * 100:+.0f} cm "
+                    f"towards the table centre, orbited {summary['orbit_deg']:+.0f} deg, "
                     f"recoveries {summary['recoveries']}"
                 )
                 exit_code = 0 if result.ready else 1
