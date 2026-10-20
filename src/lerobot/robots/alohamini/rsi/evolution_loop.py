@@ -62,6 +62,8 @@ class EpisodeOutcome:
     duration_s: float
     note: str = ""
     frames: list[str] = field(default_factory=list)
+    # Base alignments run in the episode, if the runner aligns the base (see behaviors.summarize_alignment).
+    base: list[dict] = field(default_factory=list)
 
 
 # (policy calls to make, initial state to restore first, label of the variant) -> outcome
@@ -377,6 +379,7 @@ class EvolutionLoop:
                 note=outcome.note,
                 frames=outcome.frames,
                 timestamp=time.time(),
+                base=outcome.base,
             )
         )
         self.episodes_used += 1

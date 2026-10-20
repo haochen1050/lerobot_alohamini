@@ -1,3 +1,4 @@
+import json
 import random
 
 import pytest
@@ -425,3 +426,45 @@ def loop_context(loop):
     return ProposalContext(
         loop.task, loop.baseline, loop.config.limits, loop.init_states, loop.graph, [], loop.cognition
     )
+
+
+def test_loop_tests_an_align_base_plan_and_shows_base_records_to_the_proposer(tmp_path):
+    from lerobot.robots.alohamini.rsi import ALIGN, ALIGN_BASE
+
+    class DriftingBase(World):
+        """The base drifts off its pose while the policy runs: only re-aligning before the task works.
+
+        Every episode starts with an alignment (as the robot runner does) and reports it in `base`."""
+
+        def __call__(self, steps, state, label):
+            self.episodes.append((label, state, tuple(s.kind for s in steps)))
+            kinds = [s.kind for s in steps]
+            base = [{"phase": "start", "state": "BASE_READY", "final": {"distance_cm": 0.8}}]
+            base += [{"phase": "step align_base", "state": "BASE_READY"} for k in kinds if k == ALIGN]
+            realigned = ALIGN in kinds and kinds.index(ALIGN) < len(kinds) - 1
+            return EpisodeOutcome(success=realigned, duration_s=1.0, base=base)
+
+    plan = code_payload([Step("task", 10), Step(ALIGN_BASE, 0), Step("task", 15)])
+    proposer = ScriptedProposer(
+        Proposal(
+            hypotheses=[ProposedHypothesis("realign", CODE, "re-aligning the base fixes it", payload=plan)]
+        )
+    )
+    limits = HarnessLimits(max_align_steps=1, align_time_s=60.0)
+    world = DriftingBase()
+    loop = EvolutionLoop(
+        tmp_path, "oreo", BASELINE, STATES, world, proposer, LoopConfig(episode_budget=12, limits=limits)
+    )
+    loop.run()
+
+    assert loop.graph.nodes["C1"].status == PROMOTED
+    tested = [e for e in world.episodes if e[0] == "C1"]
+    assert tested and tested[0][2] == ("policy", ALIGN, "policy")
+    records = loop.store.load()
+    assert all(r.base and r.base[0]["phase"] == "start" for r in records)
+    aligned = next(r for r in records if r.variant == ["C1"])
+    assert aligned.steps[1]["kind"] == ALIGN and aligned.steps[1]["time_s"] == 60.0
+
+    described = json.loads(describe_context(proposer.contexts[-1]))
+    assert described["harness_limits"]["max_align_steps"] == 1
+    assert any("base_alignment" in episode for episode in described["episodes"])

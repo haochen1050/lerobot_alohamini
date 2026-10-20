@@ -8,16 +8,25 @@ restore the named initial state before each episode and label it success or fail
 
 Everything is written to --run_dir after every episode; rerun the same command to resume.
 
+With --align_dir, the base is aligned to the table through the host before every episode (arms and lift held
+still), and plans may use the built-in step `align_base`. --align_dir holds the robot's calibration and taught
+target, copied from the Pi:
+    scp pi5@<robot>:~/lerobot_alohamini/outputs/table_alignment/{forward_intrinsics,forward_extrinsics,table_target}.json \
+        outputs/table_alignment/
+Each alignment's JSONL log goes to <run_dir>/alignment_logs/ and its summary into the episode record.
+
 Example:
     python examples/alohamini/rsi_evolve.py \
         --policy.path outputs/train/pi05_oreo/checkpoints/last/pretrained_model \
         --task "put the oreo in the red bowl" \
         --init_states "oreo left;oreo centre;oreo right" \
         --run_dir outputs/rsi/oreo --robot.remote_ip 192.168.1.50 --robot.robot_model alohamini2pro \
-        --inference.type rtc
+        --inference.type rtc \
+        --align_dir outputs/table_alignment --align.table_radius 0.3
 """
 
 import argparse
+import dataclasses
 import inspect
 import json
 import logging
@@ -35,7 +44,14 @@ from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.processor import make_default_processors
 from lerobot.robots.alohamini import AlohaMiniClient, AlohaMiniClientConfig
+from lerobot.robots.alohamini.behaviors import (
+    AlignConfig,
+    TableAlignmentSetup,
+    align_base_through_host,
+    summarize_alignment,
+)
 from lerobot.robots.alohamini.rsi import (
+    ALIGN,
     ClaudeProposer,
     EpisodeOutcome,
     EvolutionLoop,
@@ -99,6 +115,12 @@ class RobotEpisodeRunner:
             AlohaMiniClientConfig(remote_ip=args.remote_ip, id=args.robot_id, robot_model=args.robot_model)
         )
         self.robot.connect()
+        # One lock for every user of the client: the inference engine's thread and the base alignment.
+        self.safe_robot = ThreadSafeRobot(self.robot)
+        self.align_setup = TableAlignmentSetup.load(args.align_dir) if args.align_dir else None
+        self.align_config = AlignConfig(table_radius_m=args.align_table_radius)
+        self.align_logs = run_dir / "alignment_logs"
+        self.episode_base: list[dict] = []
 
         teleop_action_processor, self.robot_action_processor, self.robot_observation_processor = (
             make_default_processors()
@@ -138,7 +160,7 @@ class RobotEpisodeRunner:
             policy=policy,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
-            robot_wrapper=ThreadSafeRobot(self.robot),
+            robot_wrapper=self.safe_robot,
             hw_features=hw_to_dataset_features(observation_features_hw, "observation"),
             dataset_features=self.dataset_features,
             ordered_action_keys=self.ordered_action_keys,
@@ -175,8 +197,35 @@ class RobotEpisodeRunner:
             self.robot.send_action(self.robot_action_processor((action, observation)))
             precise_sleep(self.control_interval)
 
+    def _align(self, time_s: float, phase: str) -> bool:
+        """Align the base to the table through the host within time_s; True on BASE_READY."""
+        self.engine.pause()
+        config = dataclasses.replace(self.align_config, timeout_s=time_s)
+        self.align_logs.mkdir(parents=True, exist_ok=True)
+        path = (
+            self.align_logs
+            / f"episode_{self.episode:04d}_{len(self.episode_base):02d}_{phase.replace(' ', '_')}.jsonl"
+        )
+        print(f"  [{phase}] aligning the base to the table (up to {time_s:.0f}s)...")
+        with path.open("w") as file:
+
+            def log(event: dict) -> None:
+                file.write(json.dumps(event, default=str) + "\n")
+                file.flush()
+
+            result = align_base_through_host(self.safe_robot, self.align_setup, config, log=log)
+        summary = {"phase": phase, **summarize_alignment(result), "log": str(path)}
+        self.episode_base.append(summary)
+        final = summary["final"]
+        detail = f"final {final}" if final else result.reason
+        print(f"  [{phase}] {result.state.value} after {result.steps} pulses: {detail}")
+        return result.ready
+
     def _run_step(self, step: ResolvedStep) -> dict:
         """The control loop of evaluate_bi.py for one policy call with this step's instruction."""
+        if step.kind == ALIGN:
+            self._align(step.time_s, f"step {step.skill}")
+            return self._fresh_observation()
         robot, engine, interpolator = self.robot, self.engine, self.interpolator
         stop_inference(engine)
         # The engines read the instruction from this attribute on every inference call.
@@ -243,6 +292,13 @@ class RobotEpisodeRunner:
             self._return_to_start()
         else:
             self._fresh_observation()
+        self.episode_base = []
+        if self.align_setup is not None and not self.args.no_align_at_start:
+            while not self._align(self.args.align_time_s, "start"):
+                input(
+                    "[ALIGN] The base did not reach its pose at the table. Move it roughly in front of the table, "
+                    "then press Enter to retry (Ctrl+C stops the run): "
+                )
 
         started = time.perf_counter()
         observation = {}
@@ -257,7 +313,9 @@ class RobotEpisodeRunner:
         while answer not in ("y", "n"):
             answer = input("[LABEL] Did the task succeed? [y/n]: ").strip().lower()
         note = input("[NOTE] What happened, in a few words (optional, helps the next hypotheses): ").strip()
-        return EpisodeOutcome(success=answer == "y", duration_s=duration_s, note=note, frames=frames)
+        return EpisodeOutcome(
+            success=answer == "y", duration_s=duration_s, note=note, frames=frames, base=self.episode_base
+        )
 
     def close(self) -> None:
         self.engine.pause()
@@ -322,6 +380,34 @@ def main():
     )
     parser.add_argument("--inference.rtc.queue_threshold", dest="rtc_queue_threshold", type=int, default=30)
     parser.add_argument("--interpolation_multiplier", type=int, default=1)
+    parser.add_argument(
+        "--align_dir",
+        type=Path,
+        default=None,
+        help="Directory with forward_intrinsics.json, forward_extrinsics.json and table_target.json from the "
+        "robot: align the base to the table before every episode and allow align_base steps.",
+    )
+    parser.add_argument(
+        "--align.table_radius",
+        dest="align_table_radius",
+        type=float,
+        default=None,
+        help="Round table radius (m) for the alignment's orbit and keep-out circle.",
+    )
+    parser.add_argument("--align.time_s", dest="align_time_s", type=float, default=90.0)
+    parser.add_argument(
+        "--align.max_steps",
+        dest="align_max_steps",
+        type=int,
+        default=2,
+        help="align_base steps a plan may use (0 = only align before each episode).",
+    )
+    parser.add_argument(
+        "--align.no_start",
+        dest="no_align_at_start",
+        action="store_true",
+        help="Do not align before each episode (align_base steps stay available).",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
 
@@ -336,7 +422,11 @@ def main():
         episode_budget=args.budget,
         reset_time_s=args.reset_time,
         selection=SelectionConfig(n_max=args.n_max),
-        limits=HarnessLimits(max_total_time_s=args.max_episode_time),
+        limits=HarnessLimits(
+            max_total_time_s=args.max_episode_time,
+            max_align_steps=args.align_max_steps if args.align_dir else 0,
+            align_time_s=args.align_time_s,
+        ),
     )
     proposer = ClaudeProposer(model=args.claude_model)
     proposer._get_client()  # fail on a missing package or credentials before the robot moves

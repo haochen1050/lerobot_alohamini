@@ -20,6 +20,11 @@ A skill is one way of invoking the policy (an instruction and a time budget). Th
 skills run, in which order and for how long. A code hypothesis replaces the plan, a skill hypothesis replaces
 or adds skills. Nothing here can command a motor, so whatever the proposer writes, the robot only ever
 executes the trained policy under the existing safety guard, within ``HarnessLimits``.
+
+One built-in step is not a policy call: ``align_base`` runs the table alignment behaviour (the base drives back
+to the taught pose at the table, arms and lift held still). A plan may use it only when the runner supports it
+(``HarnessLimits.max_align_steps > 0``); its parameters are fixed by the runner, so a hypothesis can only choose
+where it goes in the plan and how long it may take.
 """
 
 import json
@@ -34,12 +39,20 @@ class HarnessError(ValueError):
     pass
 
 
+ALIGN_BASE = "align_base"
+POLICY, ALIGN = "policy", "align"
+ALIGN_INSTRUCTION = "(built-in) align the base to the table"
+
+
 @dataclass(frozen=True)
 class HarnessLimits:
     max_steps: int = 12
     max_total_time_s: float = 180.0
     min_step_time_s: float = 2.0
     max_instruction_chars: int = 200
+    # Built-in align_base steps allowed per plan (0 = the runner cannot align the base).
+    max_align_steps: int = 0
+    align_time_s: float = 90.0
 
 
 @dataclass(frozen=True)
@@ -59,6 +72,7 @@ class ResolvedStep:
     skill: str
     instruction: str
     time_s: float
+    kind: str = POLICY
 
 
 def code_payload(plan: Iterable[Step]) -> str:
@@ -95,8 +109,26 @@ class Harness:
         limits = limits or HarnessLimits()
         if not 1 <= len(self.plan) <= limits.max_steps:
             raise HarnessError(f"Plan needs 1..{limits.max_steps} steps, got {len(self.plan)}")
+        if ALIGN_BASE in self.skills:
+            raise HarnessError(f"'{ALIGN_BASE}' is a built-in step and cannot be defined as a skill")
+        n_align = sum(step.skill == ALIGN_BASE for step in self.plan)
+        if n_align > limits.max_align_steps:
+            raise HarnessError(
+                f"Plan uses '{ALIGN_BASE}' {n_align} times; this runner allows {limits.max_align_steps}"
+            )
         steps = []
         for step in self.plan:
+            if step.skill == ALIGN_BASE:
+                time_s = limits.align_time_s if not step.time_s else step.time_s
+                if (
+                    not isinstance(time_s, int | float)
+                    or not limits.min_step_time_s <= time_s <= limits.align_time_s
+                ):
+                    raise HarnessError(
+                        f"'{ALIGN_BASE}' needs {limits.min_step_time_s:g}..{limits.align_time_s:g}s, got {time_s}"
+                    )
+                steps.append(ResolvedStep(ALIGN_BASE, ALIGN_INSTRUCTION, float(time_s), ALIGN))
+                continue
             skill = self.skills.get(step.skill)
             if skill is None:
                 raise HarnessError(f"Plan uses unknown skill '{step.skill}'")

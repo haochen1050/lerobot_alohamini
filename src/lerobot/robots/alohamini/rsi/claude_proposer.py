@@ -53,6 +53,16 @@ adding a new skill only has an effect through a pair.
 - pair: one code and one skill hypothesis claimed to do better together than either alone. Refer to members \
 by their key from this response or by the id of an existing active hypothesis.
 
+When `harness_limits.max_align_steps` is above 0, the plan may also use the built-in step `align_base` \
+(time_s up to `harness_limits.align_time_s`, 0 for that default). It is not a policy call: the base drives \
+itself back to its taught pose at the table, measured from a tag with the forward camera, while the arms and \
+lift hold still. Its behaviour is fixed; you only choose where it goes in the plan. `align_base` is not a \
+skill name and cannot be defined as one. Episodes may carry `base_alignment`: one entry per alignment in the \
+episode (the one before the first step, then any `align_base` steps), with the base pose error before and \
+after in cm and degrees and the alignment's state. Use it to tell failures caused by where the base stood \
+apart from failures of the policy itself; a base that reached BASE_READY was within 2 cm and 2 degrees of \
+its taught pose.
+
 Use `refines` when a hypothesis is a revision of an existing one, so the history stays traceable. Do not \
 re-propose hypotheses that were refuted unless you change them in a way the evidence motivates. Prefer a few \
 hypotheses that distinguish between different explanations of the failures over many similar ones, since \
@@ -157,6 +167,7 @@ def describe_context(context: ProposalContext) -> str:
                 "success": record.success,
                 "duration_s": round(record.duration_s, 1),
                 "operator_note": record.note,
+                **({"base_alignment": record.base} if record.base else {}),
             }
             for record in context.records
         ],

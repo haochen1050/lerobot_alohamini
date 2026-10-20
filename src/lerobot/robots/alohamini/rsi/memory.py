@@ -39,6 +39,8 @@ class ExperienceRecord:
     note: str = ""
     frames: list[str] = field(default_factory=list)
     timestamp: float = 0.0
+    # Base alignments run in this episode (at the start and by align_base steps), as summarize_alignment gives.
+    base: list[dict] = field(default_factory=list)
 
 
 class ExperienceStore:

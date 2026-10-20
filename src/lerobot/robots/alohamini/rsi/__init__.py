@@ -33,6 +33,9 @@ from .experiment_selection import (
     select_experiment,
 )
 from .harness import (
+    ALIGN,
+    ALIGN_BASE,
+    POLICY,
     Harness,
     HarnessError,
     HarnessLimits,
@@ -61,6 +64,9 @@ from .hypothesis_graph import (
 from .memory import ExperienceRecord, ExperienceStore
 
 __all__ = [
+    "ALIGN",
+    "ALIGN_BASE",
+    "POLICY",
     "ACTIVE",
     "CODE",
     "PAIR",
