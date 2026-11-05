@@ -8,7 +8,8 @@ with detected tags drawn, for checking what the camera sees. Steps, in order:
 
   1. capture-charuco       Save views of the ChArUco board held in front of the camera.
   2. calibrate-intrinsics  Camera matrix + distortion from those views.
-     (Intel RealSense only: `realsense-intrinsics` reads the factory calibration instead of steps 1-2.)
+     (Factory calibration instead of steps 1-2: `orbbec-intrinsics` for an Orbbec Femto Bolt,
+     `realsense-intrinsics` for an Intel RealSense.)
   3. calibrate-extrinsics  Camera pose on the robot, from the AprilTag lying flat at a measured floor spot.
   4. watch                 Print distance / lateral / heading errors to the table tag.
   5. teach                 Park the robot at the desired pose by hand and record it as the target.
@@ -247,6 +248,127 @@ def cmd_realsense_intrinsics(args) -> None:
         f"model={intr.model} dist={np.round(coeffs, 4).tolist()} "
         f"(matches OpenCV projection to {mismatch_px:.3f} px)"
     )
+    print(f"Saved {args.out}")
+
+
+def orbbec_distortion_to_opencv(distortion, models) -> np.ndarray:
+    """OpenCV's coefficient order for an Orbbec distortion model, or SystemExit for one it has no match for."""
+    d = distortion
+    if d.model == models.NONE:
+        return np.zeros(5)
+    if d.model == models.BROWN_CONRADY:
+        return np.array([d.k1, d.k2, d.p1, d.p2, d.k3], dtype=float)
+    if d.model == models.BROWN_CONRADY_K6:
+        return np.array([d.k1, d.k2, d.p1, d.p2, d.k3, d.k4, d.k5, d.k6], dtype=float)
+    raise SystemExit(
+        f"Distortion model {d.model} has no OpenCV equivalent here; use capture-charuco / calibrate-intrinsics"
+    )
+
+
+def orbbec_projection_mismatch_px(ob, intrinsic, distortion, K: np.ndarray, coeffs: np.ndarray) -> float:
+    """Largest gap between the SDK's own projection and OpenCV's with ``coeffs``, in the corners included."""
+    corners = np.array(
+        [[0, 0], [intrinsic.width, 0], [0, intrinsic.height], [intrinsic.width, intrinsic.height]],
+        dtype=float,
+    )
+    span = np.abs((corners - [intrinsic.cx, intrinsic.cy]) / [intrinsic.fx, intrinsic.fy]).max(axis=0)
+    xs, ys = np.meshgrid(np.linspace(-span[0], span[0], 17), np.linspace(-span[1], span[1], 13))
+    rays = np.stack([xs.ravel(), ys.ravel(), np.ones(xs.size)], axis=1)
+
+    no_motion = ob.OBExtrinsic()
+    no_motion.rot = np.eye(3, dtype=np.float32).ravel()
+    no_motion.transform = np.zeros(3, dtype=np.float32)
+    # The SDK works in millimetres; the point is 1 m along each ray.
+    sdk_points = [
+        ob.transformation3dto2d(
+            ob.OBPoint3f(*(float(v) * 1000.0 for v in ray)), intrinsic, distortion, no_motion
+        )
+        for ray in rays
+    ]
+    sdk_px = np.array([[point.x, point.y] for point in sdk_points])
+    cv_px = cv2.projectPoints(rays, np.zeros(3), np.zeros(3), K, coeffs)[0].reshape(-1, 2)
+    return float(np.abs(cv_px - sdk_px).max())
+
+
+def cmd_orbbec_intrinsics(args) -> None:
+    """Factory colour intrinsics of an Orbbec camera, saved in the ChArUco calibration format."""
+    try:
+        import pyorbbecsdk as ob
+    except ImportError as e:
+        raise SystemExit(
+            "pyorbbecsdk is not installed: pip install --no-deps pyorbbecsdk2\n"
+            "(--no-deps: its examples' pinned packages are not needed and can break this environment)"
+        ) from e
+
+    devices = ob.Context().query_devices()
+    if args.serial:
+        device = devices.get_device_by_serial_number(args.serial)
+    elif devices.get_count() == 1:
+        device = devices.get_device_by_index(0)
+    else:
+        raise SystemExit(
+            f"Expected one Orbbec device (--serial for several), found {devices.get_count()}. "
+            "If it is plugged in, its udev rule may be missing: see the SDK's shared/install_udev_rules.sh"
+        )
+    info = device.get_device_info()
+
+    pipeline = ob.Pipeline(device)
+    profiles = pipeline.get_stream_profile_list(ob.OBSensorType.COLOR_SENSOR)
+    format_ = getattr(ob.OBFormat, args.fourcc)
+    config = ob.Config()
+    config.enable_stream(profiles.get_video_stream_profile(args.width, args.height, format_, args.fps))
+    # Read from a frame of the running stream, as Orbbec's examples do: the values may not be valid before that.
+    pipeline.start(config)
+    try:
+        color = None
+        for _ in range(10):
+            frames = pipeline.wait_for_frames(1000)
+            color = frames.get_color_frame() if frames is not None else None
+            if color is not None:
+                break
+        if color is None:
+            raise SystemExit("No colour frame from the camera in 10 s; is the host program still running?")
+        profile = color.get_stream_profile().as_video_stream_profile()
+        intrinsic, distortion = profile.get_intrinsic(), profile.get_distortion()
+    finally:
+        pipeline.stop()
+
+    K = np.array([[intrinsic.fx, 0.0, intrinsic.cx], [0.0, intrinsic.fy, intrinsic.cy], [0.0, 0.0, 1.0]])
+    # Orbbec reports zeros from some firmware instead of failing.
+    if (
+        intrinsic.fx <= 0
+        or intrinsic.fy <= 0
+        or not (0 < intrinsic.cx < args.width and 0 < intrinsic.cy < args.height)
+        or (intrinsic.width, intrinsic.height) != (args.width, args.height)
+    ):
+        raise SystemExit(
+            f"Invalid factory intrinsics {intrinsic} on firmware {info.get_firmware_version()}: "
+            "update the firmware, or use capture-charuco / calibrate-intrinsics"
+        )
+    coeffs = orbbec_distortion_to_opencv(distortion, ob.OBCameraDistortionModel)
+    # As for RealSense: check the coefficients numerically instead of trusting the model's name.
+    mismatch_px = orbbec_projection_mismatch_px(ob, intrinsic, distortion, K, coeffs)
+    if mismatch_px > 0.25:
+        raise SystemExit(
+            f"Distortion {distortion} differs from OpenCV's projection by up to {mismatch_px:.2f} px; "
+            "use capture-charuco / calibrate-intrinsics instead"
+        )
+
+    CameraIntrinsics(K, coeffs, (args.width, args.height)).save(args.out)
+    print(f"{info.get_name()} serial {info.get_serial_number()} firmware {info.get_firmware_version()}")
+    print(
+        f"fx={intrinsic.fx:.1f} fy={intrinsic.fy:.1f} cx={intrinsic.cx:.1f} cy={intrinsic.cy:.1f}  "
+        f"size={args.width}x{args.height}"
+    )
+    print(
+        f"model={distortion.model} dist={np.round(coeffs, 4).tolist()} "
+        f"(matches the SDK's projection to {mismatch_px:.3f} px)"
+    )
+    fov = [
+        math.degrees(2 * math.atan(n / (2 * f)))
+        for n, f in ((args.width, intrinsic.fx), (args.height, intrinsic.fy))
+    ]
+    print(f"Field of view {fov[0]:.0f} x {fov[1]:.0f} deg")
     print(f"Saved {args.out}")
 
 
@@ -594,6 +716,18 @@ def parse_args():
     sp.add_argument("--height", type=int, default=480)
     sp.add_argument("--out", default=str(DEFAULTS["intrinsics"]))
     sp.set_defaults(func=cmd_realsense_intrinsics)
+
+    sp = sub.add_parser(
+        "orbbec-intrinsics", help="Read factory colour intrinsics from an Orbbec camera (replaces steps 1-2)"
+    )
+    sp.add_argument("--serial", default=None, help="Serial number (needed if several are connected)")
+    sp.add_argument(
+        "--width", type=int, default=DEFAULT_SIZE[0], help="Must match the size the scripts capture at"
+    )
+    sp.add_argument("--height", type=int, default=DEFAULT_SIZE[1])
+    sp.add_argument("--fps", type=int, default=30)
+    sp.add_argument("--out", default=str(DEFAULTS["intrinsics"]))
+    sp.set_defaults(func=cmd_orbbec_intrinsics)
 
     sp = sub.add_parser("calibrate-extrinsics")
     tag_args(sp)
