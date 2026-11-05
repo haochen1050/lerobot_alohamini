@@ -23,10 +23,12 @@ from ..config import RobotConfig
 def alohamini_cameras_config() -> dict[str, CameraConfig]:
     return {
         "forward": OpenCVCameraConfig(
+            # Orbbec Femto Bolt colour stream: MJPEG 16:9, no 640x480. Must match forward_intrinsics.json.
             index_or_path="/dev/am_camera_forward",
             fps=30,
-            width=640,
-            height=480,
+            width=1280,
+            height=720,
+            fourcc="MJPG",
             rotation=Cv2Rotation.NO_ROTATION,
         ),
         # "backward": OpenCVCameraConfig(

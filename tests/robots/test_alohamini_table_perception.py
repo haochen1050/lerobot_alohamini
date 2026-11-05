@@ -1,5 +1,7 @@
 # ruff: noqa: N803, N806  (T_a_b / K / R follow standard transform notation)
 import math
+import sys
+import time
 
 import cv2
 import numpy as np
@@ -402,3 +404,33 @@ def test_predicted_tag_margin_out_of_view_and_behind():
     est.estimate(np.full((H, W, 3), 90, np.uint8), 0.0)
     assert est.last_tag_margin_px is None
     assert est.predict_tag_margin(0.0, 0.0, 0.0) > 50
+
+
+# ---------------------------------------------------------------- other cameras
+
+
+def test_estimator_reads_the_same_pose_at_the_bolt_resolution(monkeypatch):
+    """Nothing in the estimator assumes 640x480: 16:9 at 1280x720, with Femto Bolt-like optics (80 x 51 deg)."""
+    module = sys.modules[__name__]
+    bolt_k = np.array([[763.0, 0, 640.0], [0, 755.0, 360.0], [0, 0, 1]])
+    monkeypatch.setattr(module, "K", bolt_k)
+    monkeypatch.setattr(module, "W", 1280)
+    monkeypatch.setattr(module, "H", 720)
+    intrinsics = CameraIntrinsics(bolt_k, np.zeros(5), (1280, 720))
+
+    placement = TagPlacement(x_m=0.15, yaw_deg=-90.0, size_m=0.10)
+    target = TableTarget(distance_m=0.30)
+    T_base_table = pose_xyz_yaw(0.33, 0.01, 0.75, 2.0)
+    T_base_tag = T_base_table @ placement.T_table_tag()
+    texture, scale = tag_texture()
+    plane = (0.10 * scale, 0.10 * scale)
+    image = render_plane(texture, plane, invert(T_BASE_CAM) @ T_base_tag)
+
+    estimator = AprilTagTableEstimator(intrinsics, T_BASE_CAM, placement, target)
+    err = estimator.estimate(image, time.monotonic())
+    assert err.valid, err.reason
+    expected = table_pose_error(T_base_table, target, 0.0)
+    assert err.distance_error_m == pytest.approx(expected.distance_error_m, abs=0.01)
+    assert err.lateral_error_m == pytest.approx(expected.lateral_error_m, abs=0.015)
+    assert err.heading_error_deg == pytest.approx(expected.heading_error_deg, abs=1.0)
+    assert 0 < estimator.last_tag_margin_px < 720

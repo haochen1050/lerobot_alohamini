@@ -171,7 +171,7 @@ def main() -> int:
     target = load_target(args)
 
     intr = CameraIntrinsics.load(args.intrinsics)
-    cam = LatestFrame(args.camera, *intr.image_size)
+    cam = LatestFrame(args.camera, *intr.image_size, fourcc=args.fourcc)
     estimator = make_estimator(args, cam, target)
     try:
         cam.wait_first()

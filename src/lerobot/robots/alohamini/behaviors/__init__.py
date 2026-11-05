@@ -14,7 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .align_to_table import AXES, ERROR_FIELD, AlignConfig, AlignResult, AlignState, AlignToTable, AxisConfig
+from .align_to_table import (
+    AXES,
+    ERROR_FIELD,
+    AlignConfig,
+    AlignResult,
+    AlignState,
+    AlignToTable,
+    AxisConfig,
+    margin_scale,
+)
 from .remote_alignment import (
     RemoteBase,
     RemoteFrameSource,
@@ -30,6 +39,7 @@ __all__ = [
     "AlignResult",
     "AlignState",
     "AlignToTable",
+    "margin_scale",
     "AxisConfig",
     "RemoteBase",
     "RemoteFrameSource",

@@ -163,6 +163,8 @@ class AlignConfig:
     #    is not exact), the base turns up to +-recover_scan_deg in recover_scan_step_deg steps to find it,
     #    starting on the side the tag was last seen.
     keep_tag_in_view: bool = True
+    # The two margins are for a 640 px wide image, and scale with its width (margin_scale), so they stay the
+    # same fraction of the view at any resolution.
     view_margin_px: float = 30.0
     view_overshoot: float = 1.3
     watch_margin_px: float = 10.0
@@ -242,6 +244,11 @@ class _ViewBlockedError(Exception):
     """No variant of a planned pulse keeps the tag in view."""
 
 
+def margin_scale(image_size: tuple[int, int]) -> float:
+    """Factor for the pixel margins in AlignConfig at this image size."""
+    return image_size[0] / 640.0
+
+
 def _clamp(value: float, limit: float) -> float:
     return max(-limit, min(limit, value))
 
@@ -275,6 +282,8 @@ class AlignToTable:
         self.base = base
         self.estimator = estimator
         self.config = config or AlignConfig()
+        intrinsics = getattr(estimator, "intrinsics", None)
+        self._margin_scale = margin_scale(intrinsics.image_size) if intrinsics is not None else 1.0
         self._log = log
         self._clock = clock
         self._sleep = sleep
@@ -850,7 +859,7 @@ class AlignToTable:
         if margin is None:
             return command, duration
         now = self.estimator.predict_tag_margin(0.0, 0.0, 0.0)
-        required = min(self.config.view_margin_px, now) - 1e-6
+        required = min(self.config.view_margin_px * self._margin_scale, now) - 1e-6
         if margin >= required:
             return command, duration
         commands = [command]
@@ -889,7 +898,7 @@ class AlignToTable:
                     return False
                 return True
             state["misses"] = 0
-            if margin < cfg.watch_margin_px:
+            if margin < cfg.watch_margin_px * self._margin_scale:
                 self._event("watch_stop", reason=f"tag {margin:.0f}px from the image edge")
                 return False
             return True

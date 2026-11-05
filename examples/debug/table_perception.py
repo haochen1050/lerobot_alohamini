@@ -8,13 +8,16 @@ with detected tags drawn, for checking what the camera sees. Steps, in order:
 
   1. capture-charuco       Save views of the ChArUco board held in front of the camera.
   2. calibrate-intrinsics  Camera matrix + distortion from those views.
-     (Intel RealSense: `realsense-intrinsics` reads the factory calibration instead of steps 1-2.)
+     (Intel RealSense only: `realsense-intrinsics` reads the factory calibration instead of steps 1-2.)
   3. calibrate-extrinsics  Camera pose on the robot, from the AprilTag lying flat at a measured floor spot.
   4. watch                 Print distance / lateral / heading errors to the table tag.
   5. teach                 Park the robot at the desired pose by hand and record it as the target.
 
 Frames: base x forward, y left, z up, origin at the base centre on the floor. A tag "yaw" of -90 means
 the printed top of the tag points away from the robot with its edges parallel to the base axes.
+
+The camera is opened at --size and --fourcc (default 1280x720 MJPG, for the Orbbec Femto Bolt colour stream), and
+the calibration only holds at the size it was made at: later steps read it from the intrinsics file.
 
 Example:
   python examples/debug/table_perception.py capture-charuco
@@ -38,7 +41,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from lerobot.robots.alohamini.behaviors import AlignConfig
+from lerobot.robots.alohamini.behaviors import AlignConfig, margin_scale
 from lerobot.robots.alohamini.perception import (
     TAG_MOUNTS,
     AprilTagDetector,
@@ -58,8 +61,11 @@ from lerobot.robots.alohamini.perception import (
 from lerobot.robots.alohamini.perception.geometry import average_transforms, pose_xyz_yaw
 
 OUT = Path("outputs/table_alignment")
-# Warn at teach time when the tag sits this close to the image edge at the target pose.
+# Warn at teach time when the tag sits this close to the image edge at the target pose (at 640 px wide).
 MIN_TEACH_MARGIN_PX = 60
+# Femto Bolt colour stream. Its 16:9 modes are MJPEG; it has no 640x480.
+DEFAULT_SIZE = (1280, 720)
+DEFAULT_FOURCC = "MJPG"
 DEFAULTS = {
     "camera": "/dev/am_camera_forward",
     "charuco_dir": OUT / "charuco_forward",
@@ -74,13 +80,34 @@ logger = logging.getLogger("table_perception")
 class LatestFrame:
     """Background reader that keeps only the newest frame, so callers never see a buffered stale one."""
 
-    def __init__(self, device: str, width: int = 640, height: int = 480, fps: int = 30):
+    def __init__(
+        self,
+        device: str,
+        width: int = DEFAULT_SIZE[0],
+        height: int = DEFAULT_SIZE[1],
+        fps: int = 30,
+        fourcc: str = DEFAULT_FOURCC,
+    ):
         self.cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open camera {device} (is the host process still running?)")
+        # Pixel format first: it decides which sizes and frame rates are on offer.
+        if fourcc:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, fps)
+        # V4L2 quietly picks the nearest mode it has, and a calibration from another size is wrong.
+        actual = (
+            round(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            round(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        )
+        if actual != (width, height):
+            self.cap.release()
+            raise RuntimeError(
+                f"{device} gave {actual[0]}x{actual[1]} when asked for {width}x{height} {fourcc}. "
+                f"List its modes with: v4l2-ctl -d {device} --list-formats-ext"
+            )
         self._lock = threading.Lock()
         self._frame: tuple[np.ndarray, float] | None = None
         self._running = True
@@ -124,7 +151,7 @@ def cmd_capture_charuco(args) -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     detector = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100))
-    cam = LatestFrame(args.camera)
+    cam = LatestFrame(args.camera, *args.size, fourcc=args.fourcc)
     cam.wait_first()
     print(
         f"Hold the board in view and move it between saves: near/far, all image corners, tilted ~30 deg.\n"
@@ -256,7 +283,7 @@ def collect_tag_poses(cam: LatestFrame, detector: AprilTagDetector, tag_id: int 
 def cmd_calibrate_extrinsics(args) -> None:
     intr = CameraIntrinsics.load(args.intrinsics)
     detector = AprilTagDetector(intr, args.tag_size)
-    cam = LatestFrame(args.camera, *intr.image_size)
+    cam = LatestFrame(args.camera, *intr.image_size, fourcc=args.fourcc)
     try:
         cam.wait_first()
         observations = collect_tag_poses(cam, detector, args.tag_id, args.frames)
@@ -369,7 +396,7 @@ def load_target(args) -> TableTarget:
 def cmd_watch(args) -> None:
     target = load_target(args)
     intr = CameraIntrinsics.load(args.intrinsics)
-    cam = LatestFrame(args.camera, *intr.image_size)
+    cam = LatestFrame(args.camera, *intr.image_size, fourcc=args.fourcc)
     estimator = make_estimator(args, cam, target)
     print("Errors: + distance -> drive forward, + lateral -> strafe left, + heading -> rotate CCW")
     try:
@@ -397,7 +424,7 @@ def cmd_watch(args) -> None:
 
 def cmd_teach(args) -> None:
     intr = CameraIntrinsics.load(args.intrinsics)
-    cam = LatestFrame(args.camera, *intr.image_size)
+    cam = LatestFrame(args.camera, *intr.image_size, fourcc=args.fourcc)
     estimator = make_estimator(args, cam, TableTarget(reference_x_m=args.reference_x))
     samples: list[TableMeasurement] = []
     margins: list[float] = []
@@ -435,16 +462,17 @@ def cmd_teach(args) -> None:
     print(f"Saved {args.target}")
     margin = float(np.median(margins))
     print(f"Tag corners are {margin:.0f} px from the image edge at the target pose.")
-    if margin < MIN_TEACH_MARGIN_PX:
+    scale = margin_scale(intr.image_size)
+    if margin < MIN_TEACH_MARGIN_PX * scale:
         print(
-            f"WARNING: less than {MIN_TEACH_MARGIN_PX} px. Alignment keeps the tag at least "
-            f"{AlignConfig.view_margin_px:g} px inside the image, so corrections near the target may be blocked. "
+            f"WARNING: less than {MIN_TEACH_MARGIN_PX * scale:g} px. Alignment keeps the tag at least "
+            f"{AlignConfig.view_margin_px * scale:g} px inside the image, so corrections near the target may be blocked. "
             "Move the tag towards the image centre (or re-aim the camera) and re-teach."
         )
 
 
 def cmd_snapshot(args) -> None:
-    cam = LatestFrame(args.camera)
+    cam = LatestFrame(args.camera, *args.size, fourcc=args.fourcc)
     try:
         cam.wait_first()
         time.sleep(0.5)  # let auto-exposure settle
@@ -463,8 +491,22 @@ def cmd_snapshot(args) -> None:
 # ------------------------------------------------------------------ CLI
 
 
+def parse_size(text: str) -> tuple[int, int]:
+    width, _, height = text.partition("x")
+    return int(width), int(height)
+
+
 def add_camera_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--camera", default=DEFAULTS["camera"])
+    p.add_argument(
+        "--size",
+        type=parse_size,
+        default=DEFAULT_SIZE,
+        help="WIDTHxHEIGHT for snapshot and capture-charuco; later steps use the size in the intrinsics file",
+    )
+    p.add_argument(
+        "--fourcc", default=DEFAULT_FOURCC, help="Pixel format to request; empty for the camera's default"
+    )
     p.add_argument("--intrinsics", default=str(DEFAULTS["intrinsics"]))
     p.add_argument("--extrinsics", default=str(DEFAULTS["extrinsics"]))
 

@@ -13,9 +13,9 @@ target in outputs/table_alignment (so it assumes the tag placement used when tea
   orange  TAG REJECTED  a tag is detected but the estimator refuses it, with the reason
   red     NO TAG        nothing detected
 
-  python examples/debug/camera_view.py                      # forward camera, 640x480
-  python examples/debug/camera_view.py wrist_right
-  python examples/debug/camera_view.py forward --size 1280x720
+  python examples/debug/camera_view.py                      # forward camera, 1280x720
+  python examples/debug/camera_view.py wrist_right          # 640x480
+  python examples/debug/camera_view.py forward --size 1920x1080
   python examples/debug/camera_view.py /dev/video4
   python examples/debug/camera_view.py --tags               # forward camera with tag / table status
 """
@@ -83,6 +83,7 @@ def view_tags(args, device: Path, ffplay: str) -> None:
     cap = cv2.VideoCapture(str(device), cv2.CAP_V4L2)
     if not cap.isOpened():
         sys.exit(f"Cannot open camera {device} (is the host process still running?)")
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_FPS, args.fps)
@@ -166,13 +167,15 @@ def main() -> None:
     p.add_argument(
         "camera", nargs="?", default="forward", help=f"one of {', '.join(CAMERAS)}, or a device path"
     )
-    p.add_argument("--size", default="640x480", help="WIDTHxHEIGHT (default: 640x480)")
+    p.add_argument("--size", default=None, help="WIDTHxHEIGHT (default: forward 1280x720, others 640x480)")
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--tags", action="store_true", help="outline AprilTags and show the table alignment check")
     p.add_argument("--intrinsics", default=str(OUT / "forward_intrinsics.json"))
     p.add_argument("--extrinsics", default=str(OUT / "forward_extrinsics.json"))
     p.add_argument("--target", default=str(OUT / "table_target.json"))
     args = p.parse_args()
+    if args.size is None:
+        args.size = "1280x720" if args.camera == "forward" else "640x480"
 
     device = Path(f"/dev/am_camera_{args.camera}" if args.camera in CAMERAS else args.camera)
     if not device.exists():

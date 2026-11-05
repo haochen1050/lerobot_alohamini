@@ -809,3 +809,19 @@ def test_summary_is_written_on_fault_and_on_abort():
 
 def _wrap(angle):
     return (angle + 180.0) % 360.0 - 180.0
+
+
+def test_view_margins_scale_with_the_image_width():
+    import numpy as np
+
+    from lerobot.robots.alohamini.behaviors import margin_scale
+    from lerobot.robots.alohamini.perception import CameraIntrinsics
+
+    assert margin_scale((640, 480)) == 1.0
+    assert margin_scale((1280, 720)) == 2.0
+
+    class Estimator:
+        intrinsics = CameraIntrinsics(np.eye(3), np.zeros(5), (1280, 720))
+
+    assert AlignToTable(object(), Estimator())._margin_scale == 2.0
+    assert AlignToTable(object(), object())._margin_scale == 1.0  # no calibration to go by

@@ -33,9 +33,9 @@ The alignment uses one forward camera and one AprilTag; everything else is the r
 | Wheels | Feetech STS3250, IDs 8 (left), 9 (back), 10 (right), velocity mode, on the left-arm bus `/dev/am_arm_follower_left` with a separate base power switch |
 | Body frame | x forward, y left, rotation counter-clockwise from above (checked on hardware) |
 | Computer | Raspberry Pi 5 on the robot runs the alignment; the host program must be stopped (it holds the serial port and cameras) |
-| Forward camera | Intel RealSense D405, colour stream at 640x480, about 135 cm above the floor and 10 cm ahead of the base centre (was a 110 cm UVC camera until 2026-10-15) |
-| Camera device | udev rule maps the D405 colour node (`ATTR{index}=="4"`) to `/dev/am_camera_forward` |
-| Intrinsics | D405 factory calibration: fx 390.3, fy 389.3, cx 325.3, cy 242.8; its distortion projects like OpenCV within 0.03 px |
+| Forward camera | Orbbec Femto Bolt colour stream at 1280x720 MJPEG, since 2026-11-05; not yet calibrated or trialled. The results below are from the Intel RealSense D405 (640x480, about 135 cm above the floor and 10 cm ahead of the base centre), which replaced a 110 cm UVC camera on 2026-10-15 |
+| Camera device | udev rule maps the camera's colour node to `/dev/am_camera_forward`; the rule must be rewritten for each camera |
+| Intrinsics | Femto Bolt: ChArUco calibration at the capture size. D405 used factory calibration: fx 390.3, fy 389.3, cx 325.3, cy 242.8 at 640x480 |
 | Extrinsics | camera pose on the robot, from the tag lying at a measured spot on the table |
 | Tag | AprilTag 36h11, 10 cm black square, flat at the centre of the table |
 | Table | round, 60 cm across (radius 0.30 m), three legs; at the target the base is partly under the tabletop |
