@@ -64,6 +64,8 @@ from lerobot.robots.alohamini.perception.geometry import average_transforms, pos
 OUT = Path("outputs/table_alignment")
 # Warn at teach time when the tag sits this close to the image edge at the target pose (at 640 px wide).
 MIN_TEACH_MARGIN_PX = 60
+# The estimator's default limit: beyond it, every frame would be rejected.
+MAX_CALIBRATION_REPROJECTION_PX = 2.0
 # Femto Bolt colour stream. Its 16:9 modes are MJPEG; it has no 640x480.
 DEFAULT_SIZE = (1280, 720)
 DEFAULT_FOURCC = "MJPG"
@@ -415,7 +417,13 @@ def describe_camera(T_base_cam: np.ndarray) -> str:
     )
 
 
-def collect_tag_poses(cam: LatestFrame, detector: AprilTagDetector, tag_id: int | None, frames: int) -> list:
+def collect_tag_poses(
+    cam: LatestFrame,
+    detector: AprilTagDetector,
+    tag_id: int | None,
+    frames: int,
+    up_in_tag: np.ndarray = np.array([0.0, 0.0, 1.0]),
+) -> list:
     poses, last_t = [], None
     deadline = time.monotonic() + 10 + frames / 5
     while len(poses) < frames and time.monotonic() < deadline:
@@ -428,7 +436,9 @@ def collect_tag_poses(cam: LatestFrame, detector: AprilTagDetector, tag_id: int 
         if len(found) == 1:
             # Rough prior (camera looking forward, pitched ~45 deg down) to pick the right one of the two
             # planar PnP solutions; it only needs to be on the correct side.
-            poses.append(detector.solve(*found[0], up_in_cam=np.array([0.0, -0.7071, -0.7071])))
+            poses.append(
+                detector.solve(*found[0], up_in_cam=np.array([0.0, -0.7071, -0.7071]), up_in_tag=up_in_tag)
+            )
     return poses
 
 
@@ -436,21 +446,46 @@ def cmd_calibrate_extrinsics(args) -> None:
     intr = CameraIntrinsics.load(args.intrinsics)
     detector = AprilTagDetector(intr, args.tag_size)
     cam = LatestFrame(args.camera, *intr.image_size, fourcc=args.fourcc)
+    yaw = (
+        args.tag_yaw_deg if args.tag_yaw_deg is not None else (0.0 if args.tag_mount == "vertical" else -90.0)
+    )
+    if args.tag_mount == "vertical":
+        placement = TagPlacement(
+            x_m=args.tag_x,
+            y_m=args.tag_y,
+            yaw_deg=yaw,
+            size_m=args.tag_size,
+            mount="vertical",
+            z_m=args.tag_z,
+        )
+        T_base_tag, up_in_tag = placement.T_table_tag(), placement.up_in_tag()
+    else:
+        T_base_tag, up_in_tag = (
+            pose_xyz_yaw(args.tag_x, args.tag_y, args.tag_z, yaw),
+            np.array([0.0, 0.0, 1.0]),
+        )
     try:
         cam.wait_first()
-        observations = collect_tag_poses(cam, detector, args.tag_id, args.frames)
+        observations = collect_tag_poses(cam, detector, args.tag_id, args.frames, up_in_tag)
     finally:
         cam.close()
     if len(observations) < args.frames // 2:
         raise SystemExit(f"Tag seen in only {len(observations)} frames; check it is in view and well lit")
 
     reproj = np.median([o.reprojection_px for o in observations])
-    T_base_tag = pose_xyz_yaw(args.tag_x, args.tag_y, args.tag_z, args.tag_yaw_deg)
+    # The estimator would reject every frame anyway. The usual cause is the wrong mount: the solver is steered to
+    # the wrong one of a planar tag's two poses, and that pose fits the corners badly.
+    if reproj > MAX_CALIBRATION_REPROJECTION_PX:
+        raise SystemExit(
+            f"Nothing saved: median reprojection {reproj:.2f} px (limit {MAX_CALIBRATION_REPROJECTION_PX:g}). "
+            f"The tag was taken to be {args.tag_mount}; check --tag-mount and --tag-size, and the tag is flat and square."
+        )
     T_base_cam = solve_base_from_camera(average_transforms([o.T_cam_tag for o in observations]), T_base_tag)
     save_transform(
         args.extrinsics,
         T_base_cam,
-        tag_pose_in_base=[args.tag_x, args.tag_y, args.tag_z, args.tag_yaw_deg],
+        tag_pose_in_base=[args.tag_x, args.tag_y, args.tag_z, yaw],
+        tag_mount=args.tag_mount,
         frames=len(observations),
         median_reprojection_px=float(reproj),
     )
@@ -465,10 +500,10 @@ def cmd_calibrate_extrinsics(args) -> None:
     # of 90 deg relative to --tag-yaw-deg (the printed tag has no obvious "top").
     cam_yaw = math.degrees(math.atan2(T_base_cam[1, 2], T_base_cam[0, 2]))
     if abs(cam_yaw) > 45:
-        suggested = (args.tag_yaw_deg - 90 * round(cam_yaw / 90) + 180) % 360 - 180
+        suggested = (yaw - 90 * round(cam_yaw / 90) + 180) % 360 - 180
         print(
             f"WARNING: camera yaw {cam_yaw:+.0f} deg - the tag is probably rotated relative to "
-            f"--tag-yaw-deg {args.tag_yaw_deg:g}. Re-run with --tag-yaw-deg {suggested:g}, and use the same "
+            f"--tag-yaw-deg {yaw:g}. Re-run with --tag-yaw-deg {suggested:g}, and use the same "
             f"value for watch/teach while the tag stays in this orientation."
         )
 
@@ -763,12 +798,19 @@ def parse_args():
     tag_args(sp)
     sp.add_argument("--tag-x", type=float, required=True, help="Tag centre forward of the base centre (m)")
     sp.add_argument("--tag-y", type=float, default=0.0, help="Tag centre left of the base centre (m)")
-    sp.add_argument("--tag-z", type=float, default=0.0, help="Tag height above the floor (m)")
+    sp.add_argument("--tag-z", type=float, default=0.0, help="Tag centre height above the floor (m)")
+    sp.add_argument(
+        "--tag-mount",
+        choices=TAG_MOUNTS,
+        default="flat",
+        help="flat: lying face up. vertical: standing upright, facing the robot",
+    )
     sp.add_argument(
         "--tag-yaw-deg",
         type=float,
-        default=-90.0,
-        help="-90: printed top points away from the robot; 0: printed top points to the robot's left",
+        default=None,
+        help="Rotation about the face normal. Flat (default -90): -90 = printed top points away from the robot, "
+        "0 = to its left. Vertical (default 0): 0 = printed top points up",
     )
     sp.add_argument("--frames", type=int, default=30)
     sp.set_defaults(func=cmd_calibrate_extrinsics)

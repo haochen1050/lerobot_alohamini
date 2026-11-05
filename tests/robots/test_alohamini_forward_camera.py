@@ -1,3 +1,6 @@
+# ruff: noqa: N803, N806  (T_a_b follows standard transform notation)
+import json
+import math
 import sys
 import weakref
 from pathlib import Path
@@ -8,7 +11,13 @@ import numpy as np
 import pytest
 
 from lerobot.robots.alohamini.config_alohamini import alohamini_cameras_config
-from lerobot.robots.alohamini.perception import AprilTagDetector, CameraIntrinsics
+from lerobot.robots.alohamini.perception import (
+    AprilTagDetector,
+    CameraIntrinsics,
+    TagPlacement,
+    load_transform,
+)
+from lerobot.robots.alohamini.perception.geometry import invert, make_transform, pose_xyz_yaw
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "examples" / "debug"))
 import table_perception  # noqa: E402
@@ -353,3 +362,96 @@ def test_estimator_accepts_eight_distortion_coefficients():
     assert observation.T_cam_tag[:3, 3] == pytest.approx([0.05, -0.02, 0.8], abs=1e-3)
     # A frontal planar tag has two near-equal poses, so this is small rather than zero.
     assert observation.reprojection_px < 0.5
+
+
+# ---------------------------------------------------------------- calibrate-extrinsics
+
+
+def camera_on_robot(height=1.31, forward=0.09, pitch_down_deg=42.0):
+    p = math.radians(pitch_down_deg)
+    look = np.array([math.cos(p), 0, -math.sin(p)])
+    right = np.array([0.0, -1.0, 0.0])
+    return make_transform(np.column_stack([right, np.cross(look, right), look]), (forward, 0, height))
+
+
+class StaticCamera:
+    def __init__(self, *args, **kwargs):
+        self.t = 0.0
+
+    def __call__(self):
+        self.t += 1.0
+        return np.zeros((720, 1280, 3), np.uint8), self.t
+
+    def wait_first(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def run_extrinsics(monkeypatch, tmp_path, T_base_tag, *extra):
+    """calibrate-extrinsics with the tag's corners projected for the true pose, as the detector would give them."""
+    matrix = np.array([[746.6, 0, 638.3], [0, 746.2, 360.4], [0, 0, 1.0]])
+    coeffs = np.array([0.0771, -0.1064, 0.0003, -0.0002, 0.0436])
+    CameraIntrinsics(matrix, coeffs, (1280, 720)).save(tmp_path / "intrinsics.json")
+
+    half = 0.05
+    tag = np.array([[-half, half, 0], [half, half, 0], [half, -half, 0], [-half, -half, 0]], dtype=float)
+    T_cam_tag = invert(camera_on_robot()) @ T_base_tag
+    rvec, _ = cv2.Rodrigues(T_cam_tag[:3, :3])
+    corners = cv2.projectPoints(tag, rvec, T_cam_tag[:3, 3], matrix, coeffs)[0].reshape(4, 2)
+
+    monkeypatch.setattr(table_perception, "LatestFrame", StaticCamera)
+    monkeypatch.setattr(AprilTagDetector, "detect", lambda self, image: [(0, corners)])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "table_perception.py",
+            f"--intrinsics={tmp_path / 'intrinsics.json'}",
+            f"--extrinsics={tmp_path / 'extrinsics.json'}",
+            "calibrate-extrinsics",
+            *extra,
+        ],
+    )
+    table_perception.main()
+    return load_transform(tmp_path / "extrinsics.json")
+
+
+VERTICAL = ["--tag-x=0.45", "--tag-z=1.10", "--tag-mount=vertical"]
+
+
+@pytest.mark.parametrize("tilt_back_deg", [0, 10])
+def test_vertical_tag_recovers_the_camera(monkeypatch, tmp_path, tilt_back_deg):
+    placement = TagPlacement(x_m=0.45, yaw_deg=0.0, mount="vertical", z_m=1.10)
+    T_base_tag = placement.T_table_tag()
+    t = math.radians(tilt_back_deg)
+    T_base_tag[:3, :3] = (
+        np.array([[math.cos(t), 0, math.sin(t)], [0, 1, 0], [-math.sin(t), 0, math.cos(t)]])
+        @ T_base_tag[:3, :3]
+    )
+    found = run_extrinsics(monkeypatch, tmp_path, T_base_tag, *VERTICAL)
+    if tilt_back_deg == 0:
+        assert found[:3, 3] == pytest.approx(camera_on_robot()[:3, 3], abs=0.002)
+        assert found[:3, :3] == pytest.approx(camera_on_robot()[:3, :3], abs=0.01)
+    else:
+        # A leaning holder taken as upright goes into the camera's pitch: why calibrating flat is more accurate.
+        pitch = math.degrees(math.asin(-found[2, 2]))
+        assert pitch == pytest.approx(42.0 + tilt_back_deg, abs=0.5) or pitch == pytest.approx(
+            42.0 - tilt_back_deg, abs=0.5
+        )
+
+
+def test_a_vertical_tag_taken_as_flat_saves_nothing(monkeypatch, tmp_path):
+    # What happened on the robot: 6.68 px, and a wrong calibration saved.
+    T_base_tag = TagPlacement(x_m=0.45, yaw_deg=0.0, mount="vertical", z_m=1.10).T_table_tag()
+    with pytest.raises(SystemExit, match="Nothing saved.*check --tag-mount"):
+        run_extrinsics(monkeypatch, tmp_path, T_base_tag, "--tag-x=0.45", "--tag-z=1.10")
+    assert not (tmp_path / "extrinsics.json").exists()
+
+
+def test_flat_tag_still_recovers_the_camera(monkeypatch, tmp_path):
+    T_base_tag = pose_xyz_yaw(0.45, 0.0, 0.95, -90.0)
+    found = run_extrinsics(monkeypatch, tmp_path, T_base_tag, "--tag-x=0.45", "--tag-z=0.95")
+    assert found[:3, 3] == pytest.approx(camera_on_robot()[:3, 3], abs=0.002)
+    assert json.loads((tmp_path / "extrinsics.json").read_text())["tag_pose_in_base"][3] == -90.0
