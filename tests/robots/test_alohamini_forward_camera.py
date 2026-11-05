@@ -99,15 +99,16 @@ class FakeOrbbec:
             fx=763.0, fy=755.0, cx=640.0, cy=360.0, width=1280, height=720
         )
         self.distortion = distortion or SimpleNamespace(
+            # As reported by the robot's Femto Bolt.
             model=Models.BROWN_CONRADY_K6,
-            k1=0.08,
-            k2=-0.05,
-            k3=0.01,
-            k4=0.02,
-            k5=-0.01,
-            k6=0.005,
-            p1=0.001,
-            p2=-0.002,
+            k1=0.077084,
+            k2=-0.106400,
+            k3=0.043624,
+            k4=0.0,
+            k5=0.0,
+            k6=0.0,
+            p1=0.000252,
+            p2=-0.000159,
         )
         self.projection_error_px = projection_error_px
         self.devices = devices
@@ -191,17 +192,24 @@ class FakeOrbbec:
     def OBPoint3f(self, x, y, z):  # noqa: N802
         return (x, y, z)
 
+    def OBCameraDistortion(self):  # noqa: N802
+        return SimpleNamespace()
+
     def transformation3dto2d(self, point, intrinsic, distortion, extrinsic):
+        """Like the real SDK: distortion only for the model labelled BROWN_CONRADY, and an invalid point outside
+        the image (raising here, as nothing says what the Python binding does with one)."""
         d = distortion
         coeffs = (
-            np.zeros(5)
-            if d.model == Models.NONE
-            else np.array([d.k1, d.k2, d.p1, d.p2, d.k3, d.k4, d.k5, d.k6], dtype=float)
+            np.array([d.k1, d.k2, d.p1, d.p2, d.k3, d.k4, d.k5, d.k6], dtype=float)
+            if d.model == Models.BROWN_CONRADY
+            else np.zeros(5)
         )
         matrix = np.array([[intrinsic.fx, 0, intrinsic.cx], [0, intrinsic.fy, intrinsic.cy], [0, 0, 1.0]])
         px = cv2.projectPoints(np.array([point], dtype=float), np.zeros(3), np.zeros(3), matrix, coeffs)[
             0
         ].ravel()
+        if not (0 <= px[0] <= intrinsic.width - 1 and 0 <= px[1] <= intrinsic.height - 1):
+            raise RuntimeError(f"point {px} outside the image")
         return SimpleNamespace(x=px[0] + self.projection_error_px, y=px[1])
 
 
@@ -221,7 +229,7 @@ def test_orbbec_intrinsics_saved_in_opencv_order_at_the_capture_size(monkeypatch
     assert saved.image_size == (1280, 720)
     assert saved.camera_matrix[0, 0] == 763.0 and saved.camera_matrix[1, 2] == 360.0
     # OpenCV's order: k1 k2 p1 p2 k3 k4 k5 k6.
-    assert saved.dist_coeffs.tolist() == [0.08, -0.05, 0.001, -0.002, 0.01, 0.02, -0.01, 0.005]
+    assert saved.dist_coeffs == pytest.approx([0.077084, -0.1064, 0.000252, -0.000159, 0.043624, 0, 0, 0])
     assert "80 x 51 deg" in capsys.readouterr().out
 
 
@@ -239,6 +247,14 @@ def test_orbbec_five_coefficient_model_and_no_distortion(monkeypatch, tmp_path):
 
 def orbbec_coeffs(distortion):
     return table_perception.orbbec_distortion_to_opencv(distortion, Models).tolist()
+
+
+def test_orbbec_refuses_coefficients_labelled_as_no_distortion(monkeypatch, tmp_path):
+    # Saving zeros here would silently drop the lens distortion.
+    distortion = SimpleNamespace(model=Models.NONE, k1=0.07, k2=0, k3=0, k4=0, k5=0, k6=0, p1=0, p2=0)
+    with pytest.raises(SystemExit, match="reports no distortion"):
+        run_orbbec(monkeypatch, tmp_path, FakeOrbbec(distortion=distortion))
+    assert not (tmp_path / "intrinsics.json").exists()
 
 
 def test_orbbec_refuses_an_unknown_model(monkeypatch, tmp_path):

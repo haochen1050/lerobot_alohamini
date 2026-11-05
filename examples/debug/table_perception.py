@@ -251,10 +251,15 @@ def cmd_realsense_intrinsics(args) -> None:
     print(f"Saved {args.out}")
 
 
+ORBBEC_COEFFICIENTS = ("k1", "k2", "k3", "k4", "k5", "k6", "p1", "p2")
+
+
 def orbbec_distortion_to_opencv(distortion, models) -> np.ndarray:
     """OpenCV's coefficient order for an Orbbec distortion model, or SystemExit for one it has no match for."""
     d = distortion
     if d.model == models.NONE:
+        if any(getattr(d, name) for name in ORBBEC_COEFFICIENTS):
+            raise SystemExit(f"{d} reports no distortion but has coefficients; use capture-charuco instead")
         return np.zeros(5)
     if d.model == models.BROWN_CONRADY:
         return np.array([d.k1, d.k2, d.p1, d.p2, d.k3], dtype=float)
@@ -266,12 +271,23 @@ def orbbec_distortion_to_opencv(distortion, models) -> np.ndarray:
 
 
 def orbbec_projection_mismatch_px(ob, intrinsic, distortion, K: np.ndarray, coeffs: np.ndarray) -> float:
-    """Largest gap between the SDK's own projection and OpenCV's with ``coeffs``, in the corners included."""
+    """Largest gap between the SDK's projection and OpenCV's with ``coeffs``, over most of the image.
+
+    This checks that the coefficients are passed to OpenCV correctly, not that they fit the lens. The SDK's
+    function only applies distortion for the model labelled BROWN_CONRADY (its formula has the k4-k6 terms as
+    well) and returns no distortion for any other, so it is asked for that model.
+    """
+    labelled = ob.OBCameraDistortion()
+    for name in ORBBEC_COEFFICIENTS:
+        setattr(labelled, name, getattr(distortion, name))
+    labelled.model = ob.OBCameraDistortionModel.BROWN_CONRADY
+
     corners = np.array(
         [[0, 0], [intrinsic.width, 0], [0, intrinsic.height], [intrinsic.width, intrinsic.height]],
         dtype=float,
     )
-    span = np.abs((corners - [intrinsic.cx, intrinsic.cy]) / [intrinsic.fx, intrinsic.fy]).max(axis=0)
+    # Short of the corners: the SDK flags points that distortion carries outside the image.
+    span = 0.9 * np.abs((corners - [intrinsic.cx, intrinsic.cy]) / [intrinsic.fx, intrinsic.fy]).max(axis=0)
     xs, ys = np.meshgrid(np.linspace(-span[0], span[0], 17), np.linspace(-span[1], span[1], 13))
     rays = np.stack([xs.ravel(), ys.ravel(), np.ones(xs.size)], axis=1)
 
@@ -281,7 +297,7 @@ def orbbec_projection_mismatch_px(ob, intrinsic, distortion, K: np.ndarray, coef
     # The SDK works in millimetres; the point is 1 m along each ray.
     sdk_points = [
         ob.transformation3dto2d(
-            ob.OBPoint3f(*(float(v) * 1000.0 for v in ray)), intrinsic, distortion, no_motion
+            ob.OBPoint3f(*(float(v) * 1000.0 for v in ray)), intrinsic, labelled, no_motion
         )
         for ray in rays
     ]
@@ -348,7 +364,7 @@ def cmd_orbbec_intrinsics(args) -> None:
             "update the firmware, or use capture-charuco / calibrate-intrinsics"
         )
     coeffs = orbbec_distortion_to_opencv(distortion, ob.OBCameraDistortionModel)
-    # As for RealSense: check the coefficients numerically instead of trusting the model's name.
+    # As for RealSense: check the coefficient order numerically instead of trusting the model's name.
     mismatch_px = orbbec_projection_mismatch_px(ob, intrinsic, distortion, K, coeffs)
     if mismatch_px > 0.25:
         raise SystemExit(
@@ -364,7 +380,7 @@ def cmd_orbbec_intrinsics(args) -> None:
     )
     print(
         f"model={distortion.model} dist={np.round(coeffs, 4).tolist()} "
-        f"(matches the SDK's projection to {mismatch_px:.3f} px)"
+        f"(matches the SDK's distortion formula to {mismatch_px:.3f} px)"
     )
     fov = [
         math.degrees(2 * math.atan(n / (2 * f)))
