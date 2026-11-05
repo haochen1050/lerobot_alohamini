@@ -1,4 +1,5 @@
 import sys
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -123,13 +124,25 @@ class FakeOrbbec:
             get_firmware_version=lambda: "1.1.3",
         )
         device = SimpleNamespace(get_device_info=lambda: info)
-        return SimpleNamespace(
-            query_devices=lambda: SimpleNamespace(
-                get_count=lambda: self.devices,
-                get_device_by_index=lambda i: device,
-                get_device_by_serial_number=lambda s: device,
-            )
+
+        class Context:
+            pass
+
+        context = Context()
+        alive = weakref.ref(context)
+
+        def get_device(_):
+            # Like the real SDK: the device list is unusable once its Context has been freed.
+            if alive() is None:
+                raise RuntimeError('NULL pointer passed for argument "deviceMgr"')
+            return device
+
+        context.query_devices = lambda: SimpleNamespace(
+            get_count=lambda: self.devices,
+            get_device_by_index=get_device,
+            get_device_by_serial_number=get_device,
         )
+        return context
 
     def Config(self):  # noqa: N802
         return SimpleNamespace(enable_stream=lambda profile: self.enabled.append(profile))

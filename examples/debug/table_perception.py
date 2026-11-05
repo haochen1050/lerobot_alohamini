@@ -300,7 +300,9 @@ def cmd_orbbec_intrinsics(args) -> None:
             "(--no-deps: its examples' pinned packages are not needed and can break this environment)"
         ) from e
 
-    devices = ob.Context().query_devices()
+    # Keep the context: the device list and devices stop working once it is freed.
+    context = ob.Context()
+    devices = context.query_devices()
     if args.serial:
         device = devices.get_device_by_serial_number(args.serial)
     elif devices.get_count() == 1:
