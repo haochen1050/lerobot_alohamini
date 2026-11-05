@@ -176,7 +176,17 @@ class FakeOrbbec:
         )
 
     def OBExtrinsic(self):  # noqa: N802
-        return SimpleNamespace()
+        class Extrinsic:
+            """Like the real SDK, which rejected a flat rotation on the Pi."""
+
+            def __setattr__(self, name, value):
+                if name == "rot" and np.shape(value) != (3, 3):
+                    raise RuntimeError("rot must be a 3x3 array")
+                if name == "transform" and np.shape(value) != (3,):
+                    raise RuntimeError("transform must be a 3-element array")
+                object.__setattr__(self, name, value)
+
+        return Extrinsic()
 
     def OBPoint3f(self, x, y, z):  # noqa: N802
         return (x, y, z)

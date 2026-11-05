@@ -276,7 +276,7 @@ def orbbec_projection_mismatch_px(ob, intrinsic, distortion, K: np.ndarray, coef
     rays = np.stack([xs.ravel(), ys.ravel(), np.ones(xs.size)], axis=1)
 
     no_motion = ob.OBExtrinsic()
-    no_motion.rot = np.eye(3, dtype=np.float32).ravel()
+    no_motion.rot = np.eye(3, dtype=np.float32)
     no_motion.transform = np.zeros(3, dtype=np.float32)
     # The SDK works in millimetres; the point is 1 m along each ray.
     sdk_points = [
