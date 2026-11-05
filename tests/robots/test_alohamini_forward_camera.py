@@ -73,6 +73,43 @@ def test_empty_fourcc_leaves_the_format_alone(monkeypatch):
     assert cv2.CAP_PROP_FOURCC not in capture.calls
 
 
+def test_an_empty_mjpeg_frame_does_not_end_the_reader(monkeypatch):
+    capture = FakeCapture([(1280, 720)])
+    image = np.zeros((720, 1280, 3), np.uint8)
+    reads = iter([cv2.error("!buf.empty()"), cv2.error("!buf.empty()")])
+
+    def read():
+        for outcome in reads:
+            raise outcome
+        return True, image
+
+    capture.read = read
+    monkeypatch.setattr(table_perception.cv2, "VideoCapture", lambda *a: capture)
+    cam = table_perception.LatestFrame("/dev/fake")
+    try:
+        cam.wait_first(timeout_s=2.0)
+        assert cam()[0] is image
+        assert cam.bad_frames == 2
+    finally:
+        cam.close()
+
+
+def test_wait_first_reports_why_no_frame_came(monkeypatch):
+    capture = FakeCapture([(1280, 720)])
+
+    def read():
+        raise cv2.error("!buf.empty()")
+
+    capture.read = read
+    monkeypatch.setattr(table_perception.cv2, "VideoCapture", lambda *a: capture)
+    cam = table_perception.LatestFrame("/dev/fake")
+    try:
+        with pytest.raises(RuntimeError, match=r"bad frames, last: .*buf\.empty"):
+            cam.wait_first(timeout_s=0.1)
+    finally:
+        cam.close()
+
+
 def test_host_opens_the_forward_camera_like_the_calibration_tools():
     forward = alohamini_cameras_config()["forward"]
     assert (forward.width, forward.height) == table_perception.DEFAULT_SIZE

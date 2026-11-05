@@ -109,6 +109,8 @@ class LatestFrame:
                 f"{device} gave {actual[0]}x{actual[1]} when asked for {width}x{height} {fourcc}. "
                 f"List its modes with: v4l2-ctl -d {device} --list-formats-ext"
             )
+        self.last_error: str | None = None
+        self.bad_frames = 0
         self._lock = threading.Lock()
         self._frame: tuple[np.ndarray, float] | None = None
         self._running = True
@@ -117,7 +119,14 @@ class LatestFrame:
 
     def _loop(self) -> None:
         while self._running:
-            ok, image = self.cap.read()
+            try:
+                ok, image = self.cap.read()
+            except cv2.error as e:
+                # OpenCV raises on an empty MJPEG frame. One bad frame must not end the reader; callers see the
+                # frames stop arriving and report them as stale.
+                self.last_error = str(e).strip()
+                self.bad_frames += 1
+                ok = False
             if ok:
                 with self._lock:
                     self._frame = (image, time.monotonic())
@@ -132,7 +141,10 @@ class LatestFrame:
         deadline = time.monotonic() + timeout_s
         while self() is None:
             if time.monotonic() > deadline:
-                raise RuntimeError("No frames from camera")
+                detail = (
+                    f" ({self.bad_frames} bad frames, last: {self.last_error})" if self.bad_frames else ""
+                )
+                raise RuntimeError(f"No frames from camera{detail}")
             time.sleep(0.05)
 
     def close(self) -> None:
